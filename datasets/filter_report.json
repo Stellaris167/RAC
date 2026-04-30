@@ -1,0 +1,36 @@
+{
+  "max_prompt_len": 1024,
+  "tokenizer_path": "/share/home/cuipeng/models/Qwen2.5-VL-3B-Instruct",
+  "datasets": [
+    {
+      "name": "m3cot_test",
+      "total": 2318,
+      "kept": 2318
+    },
+    {
+      "name": "mathverse_test",
+      "total": 3940,
+      "kept": 1720
+    },
+    {
+      "name": "mathvision_test",
+      "total": 3040,
+      "kept": 1534
+    },
+    {
+      "name": "mmmu_test",
+      "total": 900,
+      "kept": 851
+    },
+    {
+      "name": "scienceqa_test",
+      "total": 4241,
+      "kept": 4241
+    },
+    {
+      "name": "we_math_test",
+      "total": 1740,
+      "kept": 1740
+    }
+  ]
+}

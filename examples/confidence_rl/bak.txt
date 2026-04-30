@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Unified launcher for confidence RL experiments.
+#
+# Experiment groups (8 total):
+#   1. baseline:   clean training, no rank/pair bonus
+#   2. ranking:    clean training, rank bonus only
+#   3. pair_T0.2:  pair training at severity 1, rank + pair bonus
+#   4. pair_T0.4:  pair training at severity 2
+#   5. pair_T0.6:  pair training at severity 3
+#   6. pair_T0.8:  pair training at severity 4
+#   7. pair_T1.0:  pair training at severity 5
+#   8. pair_main:  pair training with noisy mix = 50% T0.2 + 40% T0.4 + 10% T0.6
+#
+# Test set is unified across all experiments:
+#   6 benchmarks × 6 conditions (clean + T0.2~T1.0) = 36 test sets
+#
+# Usage:
+#   EXP=baseline  bash run_internvl3_5_8b.sh
+#   EXP=ranking   bash run_internvl3_5_8b.sh
+#   EXP=pair_T0.2 bash run_internvl3_5_8b.sh
+# =============================================================================
+set -xeuo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+DATA_ROOT="/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data"
+PYTHON_BIN=${PYTHON_BIN:-/share/home/cuipeng/miniconda3/envs/mllm_v2/bin/python}
+MODEL=${MODEL:-/share/home/cuipeng/models/InternVL3.5_8B}
+ALGO=${ALGO:-grpo}
+
+# ---- Experiment configuration ----
+EXP=${EXP:-baseline}
+
+case $EXP in
+  baseline)
+    MODE=clean
+    TRAIN_DATA="$DATA_ROOT/train/train.parquet"
+    RANK_COEF=0.0
+    CORR_COEF=0.0
+    ;;
+  ranking)
+    MODE=clean
+    TRAIN_DATA="$DATA_ROOT/train/train.parquet"
+    RANK_COEF=0.2
+    CORR_COEF=0.0
+    ;;
+  pair_T0.2)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.2.parquet"
+    RANK_COEF=0.1
+    CORR_COEF=0.3
+    ;;
+  pair_T0.4)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.4.parquet"
+    RANK_COEF=0.1
+    CORR_COEF=0.3
+    ;;
+  pair_T0.6)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.6.parquet"
+    RANK_COEF=0.1
+    CORR_COEF=0.5
+    ;;
+  pair_T0.8)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.8.parquet"
+    RANK_COEF=0.1
+    CORR_COEF=0.3
+    ;;
+  pair_T1.0)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_T1.0.parquet"
+    RANK_COEF=0.1
+    CORR_COEF=0.3
+    ;;
+  pair_main)
+    MODE=pair
+    TRAIN_DATA="$DATA_ROOT/train/train_pair_main.parquet"
+    RANK_COEF=0.15
+    # 0.1
+    CORR_COEF=0.3
+    # 0.3
+    ;;
+  *)
+    echo "Unknown EXP=$EXP. Use: baseline, ranking, pair_T0.2, pair_T0.4, pair_T0.6, pair_T0.8, pair_T1.0, pair_main"
+    exit 1
+    ;;
+esac
+
+LEN_COEF=${LEN_COEF:-0.0}
+
+# ---- Unified test sets: 6 benchmarks × 6 conditions (clean + 5 severities) ----
+VAL_FILES="[\
+$DATA_ROOT/m3cot_test_processed/test.parquet,\
+$DATA_ROOT/m3cot_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/m3cot_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/m3cot_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/m3cot_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/m3cot_test_processed_T1.0/test.parquet,\
+$DATA_ROOT/mathverse_test_processed/test.parquet,\
+$DATA_ROOT/mathverse_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/mathverse_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/mathverse_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/mathverse_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/mathverse_test_processed_T1.0/test.parquet,\
+$DATA_ROOT/mathvision_test_processed/test.parquet,\
+$DATA_ROOT/mathvision_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/mathvision_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/mathvision_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/mathvision_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/mathvision_test_processed_T1.0/test.parquet,\
+$DATA_ROOT/mmmu_test_processed/test.parquet,\
+$DATA_ROOT/mmmu_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/mmmu_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/mmmu_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/mmmu_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/mmmu_test_processed_T1.0/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/scienceqa_test_processed_T1.0/test.parquet,\
+$DATA_ROOT/we_math_test_processed/test.parquet,\
+$DATA_ROOT/we_math_test_processed_T0.2/test.parquet,\
+$DATA_ROOT/we_math_test_processed_T0.4/test.parquet,\
+$DATA_ROOT/we_math_test_processed_T0.6/test.parquet,\
+$DATA_ROOT/we_math_test_processed_T0.8/test.parquet,\
+$DATA_ROOT/we_math_test_processed_T1.0/test.parquet\
+]"
+
+export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+if [[ "${VLLM_ATTENTION_BACKEND:-}" == "XFORMERS" || "${VLLM_ATTENTION_BACKEND:-}" == "TORCH_SDPA" ]]; then
+  unset VLLM_ATTENTION_BACKEND
+fi
+export HF_HOME=${HF_HOME:-/share/home/cuipeng/.cache/huggingface}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
+
+HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=$ALGO \
+    data.train_files=$TRAIN_DATA \
+    data.val_files=$VAL_FILES \
+    data.custom_cls.path=$PROJECT_DIR/verl/trainer/reward_fn/confidence_dataset.py \
+    data.custom_cls.name=ConfidenceRLDataset \
+    data.train_batch_size=600 \
+    data.max_prompt_length=2500 \
+    data.max_response_length=3072 \
+    data.prompt_key=message_internvl \
+    data.trust_remote_code=true \
+    data.reward_fn_key=data_source \
+    +data.max_model_len=60000 \
+    +data.inject_confidence=true \
+    +data.split_data_source_by_corruption=true \
+    data.image_key=images \
+    actor_rollout_ref.model.path=$MODEL \
+    actor_rollout_ref.model.enable_gradient_checkpointing=true \
+    actor_rollout_ref.model.trust_remote_code=true \
+    actor_rollout_ref.model.use_remove_padding=true \
+    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=49152 \
+    actor_rollout_ref.actor.optim.min_lr_ratio=0.5 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=150 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.use_dynamic_bsz=true \
+    actor_rollout_ref.actor.use_torch_compile=false \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.use_kl_loss=true \
+    actor_rollout_ref.actor.kl_loss_coef=0.005 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.top_p=0.95 \
+    actor_rollout_ref.rollout.top_k=20 \
+    +actor_rollout_ref.rollout.repetition_penalty=1.10 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.max_num_seqs=256 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=true \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=true \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20 \
+    reward.custom_reward_function.path=$PROJECT_DIR/verl/trainer/reward_fn/confidence_reward.py \
+    reward.custom_reward_function.name=compute_score \
+    +reward.custom_reward_function.reward_kwargs.format_reward_coef=0.3 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_warmup_start=1.0 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_warmup_steps=10 \
+    +reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1 \
+    reward.reward_manager.source=register \
+    reward.reward_manager.name=naive \
+    +reward.reward_shaping.path=$PROJECT_DIR/verl/trainer/reward_fn/reward_shaping.py \
+    +reward.reward_shaping.name=apply_reward_shaping \
+    +reward.reward_shaping.rank_reward_coef=$RANK_COEF \
+    +reward.reward_shaping.rank_reward_margin=0.05 \
+    +reward.reward_shaping.corr_reward_coef=$CORR_COEF \
+    +reward.reward_shaping.corr_reward_margin=0.05 \
+    +reward.reward_shaping.corr_reward_alpha=0.1 \
+    +reward.reward_shaping.len_reward_coef=$LEN_COEF \
+    algorithm.use_kl_in_reward=false \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=true \
+    trainer.total_epochs=2 \
+    trainer.save_freq=6 \
+    trainer.test_freq=3 \
+    trainer.project_name=confidence-rl \
+    trainer.experiment_name=intern3.5vl8b-${ALGO}-${EXP} \
+    trainer.logger="['console','wandb']" \
+    trainer.n_gpus_per_node=6 \
+    trainer.nnodes=1 \
+    trainer.validation_data_dir=$PROJECT_DIR/logs/val_dumps/intern3.5vl8b-${ALGO}-${EXP} \
+    trainer.default_local_dir=$PROJECT_DIR/checkpoints/intern3.5vl8b-${ALGO}-${EXP}

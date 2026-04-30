@@ -1,0 +1,251 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: RUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=RUN
+    task:
+    - algorithm.adv_estimator=grpo
+    - data.train_files=/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/train/train_pair_main.parquet
+    - data.val_files=[/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T1.0/test.parquet]
+    - data.custom_cls.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/confidence_dataset.py
+    - data.custom_cls.name=ConfidenceRLDataset
+    - data.train_batch_size=512
+    - data.max_prompt_length=2048
+    - data.max_response_length=3072
+    - data.val_batch_size=1024
+    - data.prompt_key=message_qwenvl
+    - data.reward_fn_key=data_source
+    - +data.inject_confidence=true
+    - +data.split_data_source_by_corruption=true
+    - data.image_key=images
+    - actor_rollout_ref.model.path=/share/home/cuipeng/models/Qwen2.5-VL-7B-Instruct
+    - actor_rollout_ref.model.enable_gradient_checkpointing=true
+    - actor_rollout_ref.model.trust_remote_code=true
+    - actor_rollout_ref.model.use_remove_padding=true
+    - +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2
+    - actor_rollout_ref.actor.optim.lr=1e-6
+    - actor_rollout_ref.actor.optim.lr_warmup_steps=5
+    - actor_rollout_ref.actor.optim.lr_scheduler_type=cosine
+    - actor_rollout_ref.actor.optim.min_lr_ratio=0.5
+    - actor_rollout_ref.actor.ppo_mini_batch_size=128
+    - actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4
+    - actor_rollout_ref.actor.use_dynamic_bsz=true
+    - actor_rollout_ref.actor.use_torch_compile=false
+    - actor_rollout_ref.actor.clip_ratio_low=0.2
+    - actor_rollout_ref.actor.clip_ratio_high=0.28
+    - actor_rollout_ref.actor.use_kl_loss=true
+    - actor_rollout_ref.actor.kl_loss_coef=0.005
+    - actor_rollout_ref.actor.kl_loss_type=low_var_kl
+    - actor_rollout_ref.actor.fsdp_config.param_offload=true
+    - actor_rollout_ref.actor.fsdp_config.optimizer_offload=true
+    - actor_rollout_ref.rollout.name=vllm
+    - actor_rollout_ref.rollout.n=8
+    - actor_rollout_ref.rollout.temperature=0.6
+    - actor_rollout_ref.rollout.top_p=0.95
+    - actor_rollout_ref.rollout.top_k=20
+    - +actor_rollout_ref.rollout.repetition_penalty=1.10
+    - actor_rollout_ref.rollout.tensor_model_parallel_size=1
+    - actor_rollout_ref.rollout.gpu_memory_utilization=0.75
+    - actor_rollout_ref.rollout.max_num_seqs=256
+    - +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=true
+    - actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true
+    - actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20
+    - actor_rollout_ref.ref.fsdp_config.param_offload=true
+    - actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true
+    - actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20
+    - reward.custom_reward_function.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/confidence_reward.py
+    - reward.custom_reward_function.name=compute_score
+    - +reward.custom_reward_function.reward_kwargs.format_reward_coef=0.3
+    - +reward.custom_reward_function.reward_kwargs.format_reward_warmup_start=1.0
+    - +reward.custom_reward_function.reward_kwargs.format_reward_warmup_steps=10
+    - +reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1
+    - reward.reward_manager.source=register
+    - reward.reward_manager.name=naive
+    - +reward.reward_shaping.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/reward_shaping.py
+    - +reward.reward_shaping.name=apply_reward_shaping
+    - +reward.reward_shaping.rank_reward_coef=0.1
+    - +reward.reward_shaping.rank_reward_margin=0.05
+    - +reward.reward_shaping.corr_reward_coef=0.3
+    - +reward.reward_shaping.corr_reward_margin=0.05
+    - +reward.reward_shaping.corr_reward_alpha=0.1
+    - +reward.reward_shaping.len_reward_coef=0.0
+    - algorithm.use_kl_in_reward=false
+    - actor_rollout_ref.rollout.val_kwargs.n=1
+    - actor_rollout_ref.rollout.val_kwargs.temperature=0.6
+    - actor_rollout_ref.rollout.val_kwargs.top_p=0.95
+    - actor_rollout_ref.rollout.val_kwargs.top_k=20
+    - actor_rollout_ref.rollout.val_kwargs.do_sample=true
+    - trainer.total_epochs=2
+    - trainer.save_freq=12
+    - trainer.test_freq=6
+    - trainer.project_name=confidence-rl
+    - trainer.experiment_name=qwen2.5vl7b-grpo-pair_main
+    - trainer.logger=['console','wandb']
+    - trainer.n_gpus_per_node=6
+    - trainer.nnodes=1
+    - trainer.validation_data_dir=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/logs/val_dumps/qwen2.5vl7b-grpo-pair_main
+    - trainer.default_local_dir=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/checkpoints/qwen2.5vl7b-grpo-pair_main
+  job:
+    name: main_ppo
+    chdir: null
+    override_dirname: +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2,+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=true,+actor_rollout_ref.rollout.repetition_penalty=1.10,+data.inject_confidence=true,+data.split_data_source_by_corruption=true,+reward.custom_reward_function.reward_kwargs.format_reward_coef=0.3,+reward.custom_reward_function.reward_kwargs.format_reward_warmup_start=1.0,+reward.custom_reward_function.reward_kwargs.format_reward_warmup_steps=10,+reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1,+reward.reward_shaping.corr_reward_alpha=0.1,+reward.reward_shaping.corr_reward_coef=0.3,+reward.reward_shaping.corr_reward_margin=0.05,+reward.reward_shaping.len_reward_coef=0.0,+reward.reward_shaping.name=apply_reward_shaping,+reward.reward_shaping.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/reward_shaping.py,+reward.reward_shaping.rank_reward_coef=0.1,+reward.reward_shaping.rank_reward_margin=0.05,actor_rollout_ref.actor.clip_ratio_high=0.28,actor_rollout_ref.actor.clip_ratio_low=0.2,actor_rollout_ref.actor.fsdp_config.optimizer_offload=true,actor_rollout_ref.actor.fsdp_config.param_offload=true,actor_rollout_ref.actor.kl_loss_coef=0.005,actor_rollout_ref.actor.kl_loss_type=low_var_kl,actor_rollout_ref.actor.optim.lr=1e-6,actor_rollout_ref.actor.optim.lr_scheduler_type=cosine,actor_rollout_ref.actor.optim.lr_warmup_steps=5,actor_rollout_ref.actor.optim.min_lr_ratio=0.5,actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4,actor_rollout_ref.actor.ppo_mini_batch_size=128,actor_rollout_ref.actor.use_dynamic_bsz=true,actor_rollout_ref.actor.use_kl_loss=true,actor_rollout_ref.actor.use_torch_compile=false,actor_rollout_ref.model.enable_gradient_checkpointing=true,actor_rollout_ref.model.path=/share/home/cuipeng/models/Qwen2.5-VL-7B-Instruct,actor_rollout_ref.model.trust_remote_code=true,actor_rollout_ref.model.use_remove_padding=true,actor_rollout_ref.ref.fsdp_config.param_offload=true,actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20,actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true,actor_rollout_ref.rollout.gpu_memory_utilization=0.75,actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20,actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true,actor_rollout_ref.rollout.max_num_seqs=256,actor_rollout_ref.rollout.n=8,actor_rollout_ref.rollout.name=vllm,actor_rollout_ref.rollout.temperature=0.6,actor_rollout_ref.rollout.tensor_model_parallel_size=1,actor_rollout_ref.rollout.top_k=20,actor_rollout_ref.rollout.top_p=0.95,actor_rollout_ref.rollout.val_kwargs.do_sample=true,actor_rollout_ref.rollout.val_kwargs.n=1,actor_rollout_ref.rollout.val_kwargs.temperature=0.6,actor_rollout_ref.rollout.val_kwargs.top_k=20,actor_rollout_ref.rollout.val_kwargs.top_p=0.95,algorithm.adv_estimator=grpo,algorithm.use_kl_in_reward=false,data.custom_cls.name=ConfidenceRLDataset,data.custom_cls.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/confidence_dataset.py,data.image_key=images,data.max_prompt_length=2048,data.max_response_length=3072,data.prompt_key=message_qwenvl,data.reward_fn_key=data_source,data.train_batch_size=512,data.train_files=/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/train/train_pair_main.parquet,data.val_batch_size=1024,data.val_files=[/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/m3cot_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathverse_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mathvision_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/mmmu_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/scienceqa_test_processed_T1.0/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.2/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.4/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.6/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T0.8/test.parquet,/share/home/cuipeng/cuipeng_a100/yangboyao/datasets/SCS_data/we_math_test_processed_T1.0/test.parquet],reward.custom_reward_function.name=compute_score,reward.custom_reward_function.path=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/reward_fn/confidence_reward.py,reward.reward_manager.name=naive,reward.reward_manager.source=register,trainer.default_local_dir=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/checkpoints/qwen2.5vl7b-grpo-pair_main,trainer.experiment_name=qwen2.5vl7b-grpo-pair_main,trainer.logger=['console','wandb'],trainer.n_gpus_per_node=6,trainer.nnodes=1,trainer.project_name=confidence-rl,trainer.save_freq=12,trainer.test_freq=6,trainer.total_epochs=2,trainer.validation_data_dir=/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/logs/val_dumps/qwen2.5vl7b-grpo-pair_main
+    id: ???
+    num: ???
+    config_name: ppo_trainer
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.3'
+    cwd: /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/examples/confidence_rl
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/verl/trainer/config
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/examples/confidence_rl/outputs/2026-04-23/15-58-33
+    choices:
+      distillation: distillation
+      algorithm@algorithm.rollout_correction: rollout_correction
+      reward: reward
+      model@critic.model: hf_model
+      model@actor_rollout_ref.model: hf_model
+      rollout@actor_rollout_ref.rollout: rollout
+      data: legacy_data
+      model_engine: dp
+      critic: dp_critic
+      critic/../engine@critic.fsdp: fsdp
+      critic/../optim@critic.optim: fsdp
+      ref@actor_rollout_ref.ref: dp_ref
+      ref/../engine@actor_rollout_ref.ref.fsdp_config: fsdp
+      actor@actor_rollout_ref.actor: dp_actor
+      actor/../engine@actor_rollout_ref.actor.fsdp_config: fsdp
+      actor/../optim@actor_rollout_ref.actor.optim: fsdp
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false

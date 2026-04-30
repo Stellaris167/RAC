@@ -1,0 +1,10 @@
+{"time":"2026-04-23T18:08:15.639084452+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpdqwkq2zl/port-456036.txt","pid":456036,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-04-23T18:08:15.640039746+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":456036}
+{"time":"2026-04-23T18:08:15.640012901+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-456036-469825-1319767934/socket","Net":"unix"}}
+{"time":"2026-04-23T18:08:15.812174362+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-04-23T18:08:15.820723574+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"mvqy2qzd","id":"1(@)"}
+{"time":"2026-04-23T18:08:18.16479084+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"mvqy2qzd","id":"1(@)"}
+{"time":"2026-04-23T18:08:21.353444239+08:00","level":"INFO","msg":"connection: cancelling request","id":"1(@)","requestId":"bo1b7cxgddbh"}
+{"time":"2026-04-23T18:08:27.714612956+08:00","level":"INFO","msg":"connection: cancelling request","id":"1(@)","requestId":"bo1b7cxgddbh"}
+{"time":"2026-04-23T18:08:27.715257755+08:00","level":"INFO","msg":"handleInformFinish: finish message received","streamId":"mvqy2qzd","id":"1(@)"}
+{"time":"2026-04-23T18:08:27.72074584+08:00","level":"INFO","msg":"handleInformFinish: stream closed","streamId":"mvqy2qzd","id":"1(@)"}

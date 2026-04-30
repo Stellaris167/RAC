@@ -1,0 +1,35 @@
+{
+  "os": "Linux-6.8.0-53-generic-x86_64-with-glibc2.39",
+  "python": "CPython 3.11.15",
+  "startedAt": "2026-04-23T08:48:20.571777Z",
+  "args": [
+    "--node-ip-address=10.25.2.20",
+    "--node-manager-port=42399",
+    "--object-store-name=/tmp/ray/session_2026-04-23_16-42-37_355680_302841/sockets/plasma_store",
+    "--raylet-name=/tmp/ray/session_2026-04-23_16-42-37_355680_302841/sockets/raylet",
+    "--redis-address=None",
+    "--metrics-agent-port=0",
+    "--logging-rotate-bytes=536870912",
+    "--logging-rotate-backup-count=5",
+    "--runtime-env-agent-port=0",
+    "--gcs-address=10.25.2.20:33985",
+    "--session-name=session_2026-04-23_16-42-37_355680_302841",
+    "--temp-dir=/tmp/ray",
+    "--webui=127.0.0.1:8265",
+    "--cluster-id=b7831a66eebf1456404add7c56e08d30d062b52a3b60a43eae4d3430",
+    "--worker-id=a94c9255bb70f4f0955bb2f3c544c265506a7a1eeeba057997d65b50",
+    "--worker-launch-time-ms=1776933790957",
+    "--node-id=17d4597a275d0700b610e411a278d78f4eba725fae1f2f6f55e183a6",
+    "--runtime-env-hash=1725859176"
+  ],
+  "program": "/share/home/cuipeng/miniconda3/envs/mllm_v2/lib/python3.11/site-packages/ray/_private/workers/default_worker.py",
+  "git": {
+    "remote": "https://github.com/verl-project/verl.git",
+    "commit": "866a1eaa55e3f33045ea1ca93fb24c2ee02e38f3"
+  },
+  "email": "1593369043@qq.com",
+  "root": "/share/home/cuipeng/cuipeng_a100/yangboyao/RLC/examples/confidence_rl",
+  "host": "pod11-b300gpu20",
+  "executable": "/share/home/cuipeng/miniconda3/envs/mllm_v2/bin/python",
+  "writerId": "pog0i8f7d9tfw2o5vlbkzkw5f9thwvna"
+}
