@@ -36,6 +36,67 @@ from verl.utils.tokenizer import normalize_token_ids
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_DATASET_ROOT_MARKERS = (
+    "/datasets/SCS_data/",
+    "\\datasets\\SCS_data\\",
+)
+
+
+def _get_local_dataset_root() -> str:
+    local_dataset_root = os.getenv("LOCAL_DATASET_ROOT")
+    if local_dataset_root:
+        return os.path.realpath(os.path.expanduser(local_dataset_root))
+
+    project_dir = os.getenv("PROJECT_DIR")
+    if project_dir:
+        return os.path.realpath(os.path.join(project_dir, "datasets"))
+
+    return os.path.realpath("/home/yby/raccoon/datasets")
+
+
+def _rewrite_legacy_dataset_path(value: str, local_dataset_root: str) -> str:
+    if not isinstance(value, str) or not value:
+        return value
+
+    prefix = ""
+    raw_path = value
+    if value.startswith("file://"):
+        prefix = "file://"
+        raw_path = value[7:]
+
+    if os.path.exists(raw_path):
+        return value
+
+    normalized_path = raw_path.replace("\\", "/")
+    for marker in _LEGACY_DATASET_ROOT_MARKERS:
+        normalized_marker = marker.replace("\\", "/")
+        marker_index = normalized_path.find(normalized_marker)
+        if marker_index < 0:
+            continue
+
+        relative_path = normalized_path[marker_index + len(normalized_marker):]
+        candidate_path = os.path.join(local_dataset_root, relative_path)
+        if os.path.exists(candidate_path):
+            return f"{prefix}{candidate_path}"
+
+    return value
+
+
+def _rewrite_multimodal_paths(value, local_dataset_root: str):
+    if isinstance(value, list):
+        return [_rewrite_multimodal_paths(item, local_dataset_root) for item in value]
+
+    if isinstance(value, dict):
+        rewritten = {}
+        for key, item in value.items():
+            if key in {"image", "video", "url", "path"} and isinstance(item, str):
+                rewritten[key] = _rewrite_legacy_dataset_path(item, local_dataset_root)
+            else:
+                rewritten[key] = _rewrite_multimodal_paths(item, local_dataset_root)
+        return rewritten
+
+    return value
+
 
 def collate_fn(data_list: list[dict]) -> dict:
     """
@@ -410,6 +471,8 @@ class RLHFDataset(Dataset):
         """
         from qwen_vl_utils import process_vision_info
 
+        local_dataset_root = _get_local_dataset_root()
+        messages = _rewrite_multimodal_paths(messages, local_dataset_root)
         images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
         return images, videos
 

@@ -115,6 +115,7 @@ class NaiveRewardManager(RewardManagerBase):
             raw_prompt=data_item.non_tensor_batch.get("raw_prompt"),
             response_str=response_str,
             reward_extra_info=reward_extra_info,
+            response_token_ids=valid_response_ids.detach().cpu().tolist(),
         )
 
         reward = score

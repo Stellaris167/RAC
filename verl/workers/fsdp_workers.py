@@ -368,6 +368,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModelForImageTextToText = AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.tokenizer import bind_processor_tokens_to_model
         from verl.utils.torch_dtypes import PrecisionType
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
@@ -482,6 +483,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
+            bind_processor_tokens_to_model(actor_module, self.processor)
 
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
             if use_liger:
@@ -545,6 +547,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+            bind_processor_tokens_to_model(actor_module, self.processor)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):

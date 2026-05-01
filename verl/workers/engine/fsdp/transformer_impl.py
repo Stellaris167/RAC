@@ -215,6 +215,7 @@ class FSDPEngine(BaseEngine):
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
+        from verl.utils.tokenizer import bind_processor_tokens_to_model
 
         torch_dtype = self.engine_config.model_dtype
 
@@ -240,6 +241,7 @@ class FSDPEngine(BaseEngine):
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
+                bind_processor_tokens_to_model(module, self.model_config.get_processor())
             else:
                 from verl.utils.model import load_valuehead_model
 
@@ -256,6 +258,7 @@ class FSDPEngine(BaseEngine):
                     model_config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
+                bind_processor_tokens_to_model(module, self.model_config.get_processor())
 
             use_liger = self.model_config.use_liger
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
@@ -290,6 +293,8 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_lora_module(self, module):
+        from verl.utils.tokenizer import bind_processor_tokens_to_model
+
         module.enable_input_require_grads()
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
@@ -320,6 +325,7 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
+        bind_processor_tokens_to_model(module, self.model_config.get_processor())
         return module
 
     def _build_fsdp_module(self, module):

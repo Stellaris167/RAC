@@ -73,6 +73,70 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _get_debug_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"Invalid {name}={value!r}; falling back to {default}", flush=True)
+        return default
+
+
+def _safe_index(values: Any, index: int, default: Any = None) -> Any:
+    if values is None:
+        return default
+    try:
+        return values[index]
+    except Exception:
+        return default
+
+
+def _render_raw_prompt(raw_prompt: Any) -> str:
+    if isinstance(raw_prompt, str):
+        return raw_prompt
+    if not isinstance(raw_prompt, list):
+        return repr(raw_prompt)
+
+    rendered_messages = []
+    for message in raw_prompt:
+        if not isinstance(message, dict):
+            rendered_messages.append(repr(message))
+            continue
+        role = message.get("role", "unknown")
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    parts.append(repr(item))
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append(str(item.get("text", "")))
+                elif item_type == "image":
+                    parts.append("<image>")
+                elif item_type == "video":
+                    parts.append("<video>")
+                else:
+                    parts.append(repr(item))
+            text = "".join(parts)
+        else:
+            text = repr(content)
+        rendered_messages.append(f"[{role}]\n{text}")
+    return "\n\n".join(rendered_messages)
+
+
+def _truncate_debug_text(value: Any, max_chars: int) -> str:
+    text = value if isinstance(value, str) else repr(value)
+    if max_chars > 0 and len(text) > max_chars:
+        return f"{text[:max_chars]}\n...[truncated {len(text) - max_chars} chars]"
+    return text
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -300,6 +364,9 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self.debug_print_samples = max(_get_debug_env_int("VERL_DEBUG_PRINT_SAMPLES", 0), 0)
+        self.debug_max_steps = max(_get_debug_env_int("VERL_DEBUG_MAX_STEPS", 1), 0)
+        self.debug_text_chars = max(_get_debug_env_int("VERL_DEBUG_TEXT_CHARS", 12000), 0)
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -531,6 +598,76 @@ class RayPPOTrainer:
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _maybe_log_step_debug(self, batch: DataProto, stage: str) -> None:
+        if self.debug_print_samples <= 0 or self.debug_max_steps <= 0 or self.global_steps > self.debug_max_steps:
+            return
+
+        try:
+            prompt_ids = batch.batch["prompts"]
+            response_ids = batch.batch["responses"]
+            attention_mask = batch.batch["attention_mask"]
+        except KeyError as exc:
+            print(
+                f"[verl-step-debug] skipped stage={stage} global_step={self.global_steps}: missing {exc}",
+                flush=True,
+            )
+            return
+
+        reward_models = batch.non_tensor_batch.get("reward_model")
+        raw_prompts = batch.non_tensor_batch.get("raw_prompt")
+        data_sources = batch.non_tensor_batch.get("data_source")
+        sample_count = min(self.debug_print_samples, len(batch))
+        prompt_width = prompt_ids.shape[-1]
+
+        print(
+            f"[verl-step-debug] stage={stage} global_step={self.global_steps} sample_count={sample_count}/{len(batch)}",
+            flush=True,
+        )
+        for sample_idx in range(sample_count):
+            valid_prompt_length = int(attention_mask[sample_idx][:prompt_width].sum().item())
+            valid_response_length = int(attention_mask[sample_idx][prompt_width:].sum().item())
+            valid_prompt_ids = (
+                prompt_ids[sample_idx][-valid_prompt_length:] if valid_prompt_length > 0 else prompt_ids[sample_idx][:0]
+            )
+            valid_response_ids = (
+                response_ids[sample_idx][:valid_response_length]
+                if valid_response_length > 0
+                else response_ids[sample_idx][:0]
+            )
+
+            prompt_text = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
+            response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
+            raw_prompt = _safe_index(raw_prompts, sample_idx)
+            rendered_prompt = _render_raw_prompt(raw_prompt) if raw_prompt is not None else prompt_text
+            reward_model = _safe_index(reward_models, sample_idx, {})
+            ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else reward_model
+            data_source = _safe_index(data_sources, sample_idx, "<unknown>")
+
+            print(
+                f"[verl-step-debug][meta] stage={stage} global_step={self.global_steps} sample={sample_idx} data_source={data_source}",
+                flush=True,
+            )
+            print(
+                f"[verl-step-debug][prompt_raw] {_truncate_debug_text(rendered_prompt, self.debug_text_chars)}",
+                flush=True,
+            )
+            print(
+                f"[verl-step-debug][prompt_decoded] {_truncate_debug_text(prompt_text, self.debug_text_chars)}",
+                flush=True,
+            )
+            print(
+                f"[verl-step-debug][ground_truth] {_truncate_debug_text(ground_truth, self.debug_text_chars)}",
+                flush=True,
+            )
+            print(
+                f"[verl-step-debug][response] {_truncate_debug_text(response_text, self.debug_text_chars)}",
+                flush=True,
+            )
+            print(
+                f"[verl-step-debug][response_token_ids] {valid_response_ids.detach().cpu().tolist()}",
+                flush=True,
+            )
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -1496,6 +1633,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    self._maybe_log_step_debug(batch, stage="post_generate")
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)

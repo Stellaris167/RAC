@@ -128,6 +128,7 @@ $DATA_ROOT/we_math_test_processed_T0.8/test.parquet,\
 $DATA_ROOT/we_math_test_processed_T1.0/test.parquet\
 ]"
 
+export WANDB_API_KEY="8cdd1a52817745e3e2df67a50ead3eb0c0a63656"
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 if [[ "${VLLM_ATTENTION_BACKEND:-}" == "XFORMERS" || "${VLLM_ATTENTION_BACKEND:-}" == "TORCH_SDPA" ]]; then
   unset VLLM_ATTENTION_BACKEND
@@ -136,6 +137,31 @@ export HF_HOME=${HF_HOME:-/home/yby/.cache/huggingface}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
+export VERL_DEBUG_PRINT_SAMPLES=${VERL_DEBUG_PRINT_SAMPLES:-2}
+export VERL_DEBUG_MAX_STEPS=${VERL_DEBUG_MAX_STEPS:-1}
+export VERL_DEBUG_TEXT_CHARS=${VERL_DEBUG_TEXT_CHARS:-12000}
+export VERIFY_REMOTE_MODEL_IMPORT=${VERIFY_REMOTE_MODEL_IMPORT:-1}
+
+REWARD_DEBUG_DIR=${REWARD_DEBUG_DIR:-$PROJECT_DIR/logs/reward_debug/internvl3.5-8b-${ALGO}-${EXP}}
+
+if [[ "$VERIFY_REMOTE_MODEL_IMPORT" == "1" ]]; then
+  "$PYTHON_BIN" - <<'PY'
+import os
+
+from transformers import AutoConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+model_path = os.environ["MODEL"]
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+auto_map = getattr(config, "auto_map", {}) or {}
+print(f"[model-import-check] model_path={model_path}")
+print(f"[model-import-check] auto_map_keys={sorted(auto_map)}")
+for key, value in sorted(auto_map.items()):
+    if isinstance(value, str):
+        cls = get_class_from_dynamic_module(value, model_path)
+        print(f"[model-import-check] {key} -> {cls}")
+PY
+fi
 
 HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ALGO \
@@ -170,6 +196,7 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=0.005 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.name=vllm \
@@ -184,6 +211,7 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=true \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20 \
+    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20 \
@@ -195,6 +223,9 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     +reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1 \
     reward.reward_manager.source=register \
     reward.reward_manager.name=naive \
+    +reward.reward_manager.dump_pairs=true \
+    +reward.reward_manager.dump_dir=$REWARD_DEBUG_DIR \
+    +reward.reward_manager.dump_max_samples_per_worker=16 \
     +reward.reward_shaping.path=$PROJECT_DIR/verl/trainer/reward_fn/reward_shaping.py \
     +reward.reward_shaping.name=apply_reward_shaping \
     +reward.reward_shaping.rank_reward_coef=$RANK_COEF \

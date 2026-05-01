@@ -17,7 +17,7 @@ import os
 import types
 import warnings
 
-__all__ = ["hf_tokenizer", "hf_processor", "normalize_token_ids"]
+__all__ = ["bind_processor_tokens_to_model", "hf_tokenizer", "hf_processor", "normalize_token_ids"]
 
 
 def _maybe_enable_fix_mistral_regex(name_or_path, kwargs: dict):
@@ -32,6 +32,28 @@ def _maybe_enable_fix_mistral_regex(name_or_path, kwargs: dict):
             kwargs["fix_mistral_regex"] = True
 
     return kwargs
+
+
+def bind_processor_tokens_to_model(model, processor):
+    """Bind processor-derived special token ids onto multimodal model instances."""
+
+    image_context_token_id = getattr(processor, "image_context_token_id", None)
+    if model is not None and image_context_token_id is not None:
+        setattr(model, "img_context_token_id", image_context_token_id)
+
+    return model
+
+
+def _build_internvl_processor(name_or_path, config, kwargs):
+    from transformers import AutoTokenizer
+
+    from .internvl_processor import InternVLProcessor
+
+    tokenizer_kwargs = _maybe_enable_fix_mistral_regex(name_or_path, dict(kwargs))
+    tokenizer_kwargs["use_fast"] = False
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **tokenizer_kwargs)
+    set_pad_token_id(tokenizer)
+    return InternVLProcessor(tokenizer=tokenizer, config=config)
 
 
 def normalize_token_ids(tokenized_output) -> list[int]:
@@ -128,10 +150,9 @@ def hf_processor(name_or_path, **kwargs):
         Returns ``None`` for text-only models (including AutoProcessor fallbacks to
         tokenizer backends such as ``TokenizersBackend``).
     """
-    from transformers import AutoConfig, AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
+    from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
 
-    from .internvl_processor import InternVLProcessor
-
+    config = None
     try:
         config = AutoConfig.from_pretrained(name_or_path, **kwargs)
         processor_kwargs = _maybe_enable_fix_mistral_regex(name_or_path, dict(kwargs))
@@ -142,11 +163,7 @@ def hf_processor(name_or_path, **kwargs):
         if isinstance(processor, PreTrainedTokenizerBase):
             model_type = getattr(config, "model_type", None)
             if model_type in {"internvl_chat", "internvl"}:
-                tokenizer_kwargs = _maybe_enable_fix_mistral_regex(name_or_path, dict(kwargs))
-                tokenizer_kwargs["use_fast"] = False
-                tokenizer = AutoTokenizer.from_pretrained(name_or_path, **tokenizer_kwargs)
-                set_pad_token_id(tokenizer)
-                return InternVLProcessor(tokenizer=tokenizer, config=config)
+                return _build_internvl_processor(name_or_path, config, kwargs)
             return None
 
         # Bind vlm model's get_rope_index method to processor
@@ -167,11 +184,7 @@ def hf_processor(name_or_path, **kwargs):
             case _:
                 model_type = getattr(config, "model_type", None)
                 if model_type in {"internvl_chat", "internvl"}:
-                    tokenizer_kwargs = _maybe_enable_fix_mistral_regex(name_or_path, dict(kwargs))
-                    tokenizer_kwargs["use_fast"] = False
-                    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **tokenizer_kwargs)
-                    set_pad_token_id(tokenizer)
-                    return InternVLProcessor(tokenizer=tokenizer, config=config)
+                    return _build_internvl_processor(name_or_path, config, kwargs)
                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
 
         if rope_index_impl is not None:
@@ -179,10 +192,18 @@ def hf_processor(name_or_path, **kwargs):
         if vision_position_impl is not None:
             processor.get_vision_position_ids = types.MethodType(vision_position_impl, processor)
     except Exception as e:
-        processor = None
-        # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
-        # silent failure
-        warnings.warn(f"Failed to create processor: {e}. This may affect multimodal processing", stacklevel=1)
+        model_type = getattr(config, "model_type", None)
+        if model_type in {"internvl_chat", "internvl"}:
+            processor = _build_internvl_processor(name_or_path, config, kwargs)
+            warnings.warn(
+                f"AutoProcessor failed for InternVL ({e}); falling back to InternVLProcessor.",
+                stacklevel=1,
+            )
+        else:
+            processor = None
+            # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
+            # silent failure
+            warnings.warn(f"Failed to create processor: {e}. This may affect multimodal processing", stacklevel=1)
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/auto/processing_auto.py#L344
     if processor is not None and "Processor" not in processor.__class__.__name__:

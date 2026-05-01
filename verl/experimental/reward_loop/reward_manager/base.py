@@ -118,6 +118,7 @@ class RewardManagerBase(ABC):
         raw_prompt: Any,
         response_str: str,
         reward_extra_info: dict,
+        response_token_ids: Any = None,
     ) -> None:
         if not self.dump_pairs or self.dump_file_path is None:
             return
@@ -135,6 +136,7 @@ class RewardManagerBase(ABC):
             "prompt_text": prompt_text,
             "raw_prompt": _json_safe(raw_prompt),
             "response": response_str,
+            "response_token_ids": _json_safe(response_token_ids),
         }
         with open(self.dump_file_path, "a", encoding="utf-8") as fout:
             fout.write(f"===== SAMPLE {self.dump_pairs_count} =====\n")
