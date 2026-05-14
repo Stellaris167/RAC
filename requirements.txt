@@ -29,6 +29,6 @@ torchdata
 transformers
 vllm==0.17.0
 wandb
-wheel==0.46.3
+wheel==0.47.0
 packaging>=20.0
 uvicorn
