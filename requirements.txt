@@ -10,7 +10,7 @@ latex2sympy2_extended
 liger-kernel
 math_verify
 ninja
-numpy==1.26.4
+numpy==2.2.6
 openai
 opencv-python-headless
 pandas
