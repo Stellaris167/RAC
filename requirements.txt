@@ -23,7 +23,7 @@ pre-commit
 ray[default]
 scipy
 tensorboard
-tensordict==0.10.0
+tensordict==0.12.3
 timm
 torchdata
 transformers
