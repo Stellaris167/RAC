@@ -59,6 +59,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
+from verl.utils.internvl_processor import bind_internvl_img_context_token_id
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
@@ -79,6 +80,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _bind_internvl_processor_state(model, tokenizer=None, processor=None):
+    if getattr(getattr(model, "config", None), "model_type", None) not in {"internvl_chat", "internvl"}:
+        return
+    bind_internvl_img_context_token_id(model, tokenizer=tokenizer, processor=processor)
 
 
 class FSDPEngine(BaseEngine):
@@ -215,7 +222,6 @@ class FSDPEngine(BaseEngine):
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
-        from verl.utils.tokenizer import bind_processor_tokens_to_model
 
         torch_dtype = self.engine_config.model_dtype
 
@@ -241,7 +247,6 @@ class FSDPEngine(BaseEngine):
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
-                bind_processor_tokens_to_model(module, self.model_config.get_processor())
             else:
                 from verl.utils.model import load_valuehead_model
 
@@ -258,7 +263,6 @@ class FSDPEngine(BaseEngine):
                     model_config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
-                bind_processor_tokens_to_model(module, self.model_config.get_processor())
 
             use_liger = self.model_config.use_liger
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
@@ -284,6 +288,11 @@ class FSDPEngine(BaseEngine):
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
             )
+            _bind_internvl_processor_state(
+                module,
+                tokenizer=self.model_config.tokenizer,
+                processor=self.model_config.processor,
+            )
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
@@ -293,8 +302,6 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _build_lora_module(self, module):
-        from verl.utils.tokenizer import bind_processor_tokens_to_model
-
         module.enable_input_require_grads()
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
@@ -325,7 +332,6 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-        bind_processor_tokens_to_model(module, self.model_config.get_processor())
         return module
 
     def _build_fsdp_module(self, module):

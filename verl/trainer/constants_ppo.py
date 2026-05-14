@@ -48,11 +48,7 @@ def get_ppo_ray_runtime_env():
         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
         **({"working_dir": None} if working_dir is None else {}),
     }
-    if os.environ.get("LD_LIBRARY_PATH"):
-        runtime_env["env_vars"]["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
-    if os.environ.get("LD_LIBRARY_PATH"):
-        runtime_env["env_vars"]["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     return runtime_env

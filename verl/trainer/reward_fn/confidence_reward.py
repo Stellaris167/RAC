@@ -151,6 +151,37 @@ def _trailing_text_after_confidence(text: str) -> str:
     return text[last_conf.end():].strip()
 
 
+def _schema_compliance_score(
+    text: str,
+    *,
+    is_multiple_choice: bool = False,
+    choices=None,
+) -> float:
+    """Return a soft schema score in [0, 1] for format-failed samples."""
+    answer_m = _RE_ANSWER.search(text)
+    conf_m = _RE_CONFIDENCE.search(text)
+    think_m = _RE_THINK.search(text)
+
+    has_think = 1.0 if think_m is not None else 0.0
+    has_answer = 1.0 if answer_m is not None else 0.0
+    has_conf = 1.0 if conf_m is not None else 0.0
+    answer_payload_ok = 1.0 if _answer_payload_format_ok(extract_answer_tag(text), is_multiple_choice=is_multiple_choice) else 0.0
+    conf_value_ok = 1.0 if _extract_confidence_raw(text) is not None else 0.0
+    order_ok = 1.0 if (answer_m is not None and conf_m is not None and answer_m.start() <= conf_m.start()) else 0.0
+    no_tail_after_conf = 1.0 if (conf_m is not None and _trailing_text_after_confidence(text) == "") else 0.0
+
+    soft = (
+        0.20 * has_think
+        + 0.20 * has_answer
+        + 0.20 * has_conf
+        + 0.15 * answer_payload_ok
+        + 0.10 * conf_value_ok
+        + 0.10 * order_ok
+        + 0.05 * no_tail_after_conf
+    )
+    return float(max(0.0, min(1.0, soft)))
+
+
 def check_format(text: str, is_multiple_choice: bool = False, choices=None) -> bool:
     answer_m = _RE_ANSWER.search(text)
     conf_m = _RE_CONFIDENCE.search(text)
@@ -285,6 +316,8 @@ def compute_score(
     choices = extra_info.get("choices")
     fmt_coef = _resolve_format_coef(extra_info, kwargs)
     tail_penalty_coef = float(kwargs.get("tail_text_penalty_coef", extra_info.get("tail_text_penalty_coef", 0.2)))
+    schema_bonus_coef = float(kwargs.get("schema_bonus_coef", extra_info.get("schema_bonus_coef", 0.0)))
+    schema_bonus_cap_ratio = float(kwargs.get("schema_bonus_cap_ratio", extra_info.get("schema_bonus_cap_ratio", 0.8)))
     pred, answer_source = extract_answer(solution_str, is_multiple_choice=is_mc, choices=choices)
     conf = extract_confidence_tag(solution_str)
     answer_tag_payload = extract_answer_tag(solution_str)
@@ -317,7 +350,19 @@ def compute_score(
     tail_penalty = 0.0
     if trailing_text_len > 0:
         tail_penalty = tail_penalty_coef * min(1.0, trailing_text_len / 128.0)
-    score = reward_acc - fmt_coef * (1.0 - fmt_ok) - tail_penalty
+
+    schema_soft = 1.0 if fmt_ok > 0.5 else _schema_compliance_score(
+        solution_str,
+        is_multiple_choice=is_mc,
+        choices=choices,
+    )
+    schema_bonus = 0.0
+    if fmt_ok <= 0.5 and schema_bonus_coef > 0.0:
+        schema_bonus = schema_bonus_coef * schema_soft
+        cap_ratio = max(0.0, min(1.0, schema_bonus_cap_ratio))
+        schema_bonus = min(schema_bonus, fmt_coef * cap_ratio)
+
+    score = reward_acc - fmt_coef * (1.0 - fmt_ok) - tail_penalty + schema_bonus
 
     # --- calibration gap for this sample ---
     calib_gap = abs(conf - acc) if conf >= 0 else -1.0
@@ -325,14 +370,40 @@ def compute_score(
     is_overconfident = 1.0 if (acc < 0.5 and conf > 0.5) else 0.0
     is_underconfident = 1.0 if (acc > 0.5 and conf < 0.5) else 0.0
 
+    # keep raw score for diagnostics, but provide a normalized [0,1] score
+    raw_score = float(score)
+    # allow callers to override normalization bounds via kwargs or extra_info
+    score_min = kwargs.get("score_min", extra_info.get("score_min", -1.0))
+    score_max = kwargs.get("score_max", extra_info.get("score_max", 1.0))
+    try:
+        score_min = float(score_min)
+    except (TypeError, ValueError):
+        score_min = -1.0
+    try:
+        score_max = float(score_max)
+    except (TypeError, ValueError):
+        score_max = 1.0
+
+    if score_max <= score_min:
+        score_norm = 0.5
+    else:
+        clamped = max(min(raw_score, score_max), score_min)
+        score_norm = (clamped - score_min) / (score_max - score_min)
+        score_norm = float(max(0.0, min(1.0, score_norm)))
+
     return {
-        "score": score,
+        # ``score`` is normalized to [0,1] by default; raw value kept in ``score_raw``
+        "score": score_norm,
+        "score_raw": raw_score,
+        "score_norm": score_norm,
         "acc": acc,
         "reward_acc": reward_acc,
         "confidence": conf,
         "format_ok": fmt_ok,
         "answer_format_ok": answer_format_ok,
         "format_penalty_coef": fmt_coef,
+        "schema_soft": schema_soft,
+        "schema_bonus": schema_bonus,
         "tail_text_penalty": tail_penalty,
         "tail_text_length": float(trailing_text_len),
         "is_multiple_choice": float(is_mc),

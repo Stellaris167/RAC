@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other entry points.
 """
 
+import logging
 import os
 import socket
 
@@ -31,6 +32,9 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
+
+
+logger = logging.getLogger(__name__)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -74,10 +78,8 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        ray_address = os.environ.get("RAY_ADDRESS")
-        if ray_address and not ray_init_kwargs.get("address"):
-            ray_init_kwargs["address"] = ray_address
-        print(f"ray init kwargs: {ray_init_kwargs}")
+        if os.getenv("VERL_DEBUG_CONFIG", "0") == "1":
+            logger.info("ray init kwargs: %s", ray_init_kwargs)
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
@@ -310,15 +312,19 @@ class TaskRunner:
             config: Training configuration object containing all parameters needed
                    for setting up and running the PPO training process.
         """
-        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
-        from pprint import pprint
+        from pprint import pformat
 
         from omegaconf import OmegaConf
 
         from verl.utils.fs import copy_to_local
 
-        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
+        if os.getenv("VERL_DEBUG_CONFIG", "0") == "1":
+            logger.info(
+                "TaskRunner hostname=%s pid=%s\n%s",
+                socket.gethostname(),
+                os.getpid(),
+                pformat(OmegaConf.to_container(config, resolve=True)),
+            )
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
@@ -347,10 +353,7 @@ class TaskRunner:
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
-        # Keep dataset-side tokenizer/processor aligned with the model-side loading path.
-        trust_remote_code = config.actor_rollout_ref.model.get(
-            "trust_remote_code", config.data.get("trust_remote_code", False)
-        )
+        trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)

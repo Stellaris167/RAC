@@ -5,8 +5,10 @@ Implements Strategy A (within-group confidence ranking) and Strategy B (clean-vs
 Includes comprehensive batch-level calibration/performance metrics for wandb & case study.
 """
 from __future__ import annotations
+
 import numpy as np
 import torch
+
 try:
     from scipy import stats as scipy_stats
 except Exception:  # pragma: no cover
@@ -16,8 +18,11 @@ except Exception:  # pragma: no cover
 def _binary_ece(conf: np.ndarray, acc: np.ndarray, n_bins: int = 10) -> float:
     bin_edges = np.linspace(0, 1, n_bins + 1)
     ece = 0.0
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (conf > lo) & (conf <= hi)
+    for bin_index, (low, high) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+        if bin_index == 0:
+            mask = (conf >= low) & (conf <= high)
+        else:
+            mask = (conf > low) & (conf <= high)
         if mask.sum() == 0:
             continue
         ece += mask.mean() * abs(acc[mask].mean() - conf[mask].mean())
@@ -27,14 +32,19 @@ def _binary_ece(conf: np.ndarray, acc: np.ndarray, n_bins: int = 10) -> float:
 def _ece_per_bin(conf: np.ndarray, acc: np.ndarray, n_bins: int = 10) -> list[dict]:
     bin_edges = np.linspace(0, 1, n_bins + 1)
     bins = []
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (conf > lo) & (conf <= hi)
+    for bin_index, (low, high) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+        if bin_index == 0:
+            mask = (conf >= low) & (conf <= high)
+        else:
+            mask = (conf > low) & (conf <= high)
         count = int(mask.sum())
         if count == 0:
-            bins.append({"lo": lo, "hi": hi, "count": 0, "avg_conf": 0.0, "avg_acc": 0.0, "gap": 0.0})
+            bins.append({"lo": low, "hi": high, "count": 0, "avg_conf": 0.0, "avg_acc": 0.0, "gap": 0.0})
         else:
-            ac, cc = float(acc[mask].mean()), float(conf[mask].mean())
-            bins.append({"lo": lo, "hi": hi, "count": count, "avg_conf": cc, "avg_acc": ac, "gap": abs(ac - cc)})
+            avg_acc, avg_conf = float(acc[mask].mean()), float(conf[mask].mean())
+            bins.append(
+                {"lo": low, "hi": high, "count": count, "avg_conf": avg_conf, "avg_acc": avg_acc, "gap": abs(avg_acc - avg_conf)}
+            )
     return bins
 
 
@@ -46,43 +56,37 @@ def _high_confidence_error_ratio(conf: np.ndarray, acc: np.ndarray, threshold: f
 
 
 def _build_groups_by_uid(uid_arr, n, n_per_prompt):
-    """Build rollout groups by uid when available; fallback to contiguous chunks.
-
-    Why: trainer.balance_batch=True can reorder samples before reward shaping,
-    which breaks contiguous grouping assumptions.
-    """
     if uid_arr is not None and len(uid_arr) == n:
         groups = {}
-        for idx, uid in enumerate(uid_arr):
-            groups.setdefault(uid, []).append(idx)
-        return [idxs for idxs in groups.values() if len(idxs) > 1]
+        for index, uid in enumerate(uid_arr):
+            groups.setdefault(uid, []).append(index)
+        return [indices for indices in groups.values() if len(indices) > 1]
 
-    # fallback for compatibility
     n_groups = n // n_per_prompt if n_per_prompt > 0 else 0
-    return [list(range(g * n_per_prompt, (g + 1) * n_per_prompt)) for g in range(n_groups)]
+    return [list(range(group * n_per_prompt, (group + 1) * n_per_prompt)) for group in range(n_groups)]
 
 
 def _ranking_bonus(accs, confs, groups, margin):
     bonus = np.zeros_like(accs, dtype=np.float64)
-    for idxs in groups:
-        if len(idxs) <= 1:
+    for indices in groups:
+        if len(indices) <= 1:
             continue
-        ga, gc = accs[idxs], confs[idxs]
-        for local_i, global_i in enumerate(idxs):
-            if gc[local_i] < 0:
+        group_acc, group_conf = accs[indices], confs[indices]
+        for local_i, global_i in enumerate(indices):
+            if group_conf[local_i] < 0:
                 continue
-            loss_sum, cnt = 0.0, 0
-            for local_j in range(len(idxs)):
-                if local_i == local_j or gc[local_j] < 0:
+            loss_sum, count = 0.0, 0
+            for local_j in range(len(indices)):
+                if local_i == local_j or group_conf[local_j] < 0:
                     continue
-                ds = ga[local_i] - ga[local_j]
-                if abs(ds) < 1e-8:
+                delta_score = group_acc[local_i] - group_acc[local_j]
+                if abs(delta_score) < 1e-8:
                     continue
-                sign = 1.0 if ds > 0 else -1.0
-                loss_sum += max(0.0, -sign * (gc[local_i] - gc[local_j]) + margin)
-                cnt += 1
-            if cnt:
-                bonus[global_i] = -(loss_sum / cnt)
+                sign = 1.0 if delta_score > 0 else -1.0
+                loss_sum += max(0.0, -sign * (group_conf[local_i] - group_conf[local_j]) + margin)
+                count += 1
+            if count:
+                bonus[global_i] = -(loss_sum / count)
     return bonus
 
 
@@ -122,22 +126,22 @@ def _pair_bonus(accs, confs, pair_ids, is_noisy, corr_levels, n, margin, alpha, 
 
     if uid_arr is not None and len(uid_arr) == n:
         uid_groups = {}
-        for idx, uid in enumerate(uid_arr):
-            uid_groups.setdefault(uid, []).append(idx)
+        for index, uid in enumerate(uid_arr):
+            uid_groups.setdefault(uid, []).append(index)
 
         pair_to_prompt_groups: dict[int, dict[str, list[list[int]]]] = {}
-        for idxs in uid_groups.values():
-            if not idxs:
+        for indices in uid_groups.values():
+            if not indices:
                 continue
-            pair_id = int(pair_ids[idxs[0]])
+            pair_id = int(pair_ids[indices[0]])
             if pair_id < 0:
                 continue
-            bucket = "noisy" if is_noisy[idxs[0]] >= 0.5 else "clean"
-            pair_to_prompt_groups.setdefault(pair_id, {"clean": [], "noisy": []})[bucket].append(idxs)
+            bucket = "noisy" if is_noisy[indices[0]] >= 0.5 else "clean"
+            pair_to_prompt_groups.setdefault(pair_id, {"clean": [], "noisy": []})[bucket].append(indices)
 
         for pair_id, prompt_groups in pair_to_prompt_groups.items():
-            clean_groups = sorted(prompt_groups["clean"], key=lambda idxs: idxs[0])
-            noisy_groups = sorted(prompt_groups["noisy"], key=lambda idxs: idxs[0])
+            clean_groups = sorted(prompt_groups["clean"], key=lambda indices: indices[0])
+            noisy_groups = sorted(prompt_groups["noisy"], key=lambda indices: indices[0])
             if not clean_groups or not noisy_groups:
                 continue
 
@@ -154,18 +158,18 @@ def _pair_bonus(accs, confs, pair_ids, is_noisy, corr_levels, n, margin, alpha, 
                     alpha=alpha,
                 )
 
-        cmn = float(np.mean(diffs)) if diffs else 0.0
-        return bonus, pair_count, cmn
+        clean_minus_noisy_conf = float(np.mean(diffs)) if diffs else 0.0
+        return bonus, pair_count, clean_minus_noisy_conf
 
-    for pid in np.unique(pair_ids):
-        if pid < 0:
+    for pair_id in np.unique(pair_ids):
+        if pair_id < 0:
             continue
-        idx = np.where(pair_ids == pid)[0]
-        if len(idx) < 2:
+        indices = np.where(pair_ids == pair_id)[0]
+        if len(indices) < 2:
             continue
-        clean_idx = idx[is_noisy[idx] < 0.5]
-        noisy_idx = idx[is_noisy[idx] >= 0.5]
-        if len(clean_idx) == 0 or len(noisy_idx) == 0:
+        clean_indices = indices[is_noisy[indices] < 0.5]
+        noisy_indices = indices[is_noisy[indices] >= 0.5]
+        if len(clean_indices) == 0 or len(noisy_indices) == 0:
             continue
 
         pair_count += _apply_pairwise_penalty(
@@ -174,14 +178,14 @@ def _pair_bonus(accs, confs, pair_ids, is_noisy, corr_levels, n, margin, alpha, 
             accs=accs,
             confs=confs,
             corr_levels=corr_levels,
-            clean_indices=clean_idx,
-            noisy_indices=noisy_idx,
+            clean_indices=clean_indices,
+            noisy_indices=noisy_indices,
             margin=margin,
             alpha=alpha,
         )
 
-    cmn = float(np.mean(diffs)) if diffs else 0.0
-    return bonus, pair_count, cmn
+    clean_minus_noisy_conf = float(np.mean(diffs)) if diffs else 0.0
+    return bonus, pair_count, clean_minus_noisy_conf
 
 
 def apply_reward_shaping(
@@ -208,12 +212,12 @@ def apply_reward_shaping(
         uid_arr = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
     groups = _build_groups_by_uid(uid_arr=uid_arr, n=n, n_per_prompt=n_per_prompt)
 
-    rank_b = np.zeros(n)
+    rank_bonus = np.zeros(n)
     if rank_coef != 0.0 and len(groups) > 0:
-        rank_b = _ranking_bonus(shaping_accs, confs, groups, rank_margin)
+        rank_bonus = _ranking_bonus(shaping_accs, confs, groups, rank_margin)
 
-    pair_b = np.zeros(n)
-    pair_count, cmn_conf = 0, 0.0
+    pair_bonus = np.zeros(n)
+    pair_count, clean_minus_noisy_conf = 0, 0.0
     if corr_coef != 0.0:
         def _get_array(key, default):
             if key in batch.non_tensor_batch:
@@ -221,73 +225,66 @@ def apply_reward_shaping(
             if key in reward_extra_infos_dict:
                 return np.asarray(reward_extra_infos_dict[key], dtype=np.float64)
             return np.full(n, default, dtype=np.float64)
-        pid = _get_array("pair_id", -1).astype(np.int64)
-        noisy = _get_array("is_noisy", 0.0)
-        corr_lv = _get_array("corruption_level", 0.0)
-        pair_b, pair_count, cmn_conf = _pair_bonus(
-            shaping_accs, confs, pid, noisy, corr_lv, n, corr_margin, corr_alpha, uid_arr=uid_arr
+
+        pair_ids = _get_array("pair_id", -1).astype(np.int64)
+        is_noisy = _get_array("is_noisy", 0.0)
+        corr_levels = _get_array("corruption_level", 0.0)
+        pair_bonus, pair_count, clean_minus_noisy_conf = _pair_bonus(
+            shaping_accs, confs, pair_ids, is_noisy, corr_levels, n, corr_margin, corr_alpha, uid_arr=uid_arr
         )
 
-    len_b = np.zeros(n)
+    len_bonus = np.zeros(n)
     if len_coef != 0.0:
         prompt_len = batch.batch["prompts"].shape[1]
-        valid_resp = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).cpu().numpy()
-        len_b = valid_resp / 1000.0
+        valid_response = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).cpu().numpy()
+        len_bonus = valid_response / 1000.0
 
-    total_bonus = rank_coef * rank_b + corr_coef * pair_b + len_coef * len_b
+    total_bonus = rank_coef * rank_bonus + corr_coef * pair_bonus + len_coef * len_bonus
     if abs(total_bonus.sum()) > 1e-12:
         prompt_len = batch.batch["prompts"].shape[1]
-        valid_resp_lens = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).long()
-        for i in range(n):
-            pos = int(valid_resp_lens[i].item()) - 1
+        valid_response_lengths = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).long()
+        for index in range(n):
+            pos = int(valid_response_lengths[index].item()) - 1
             if pos >= 0:
-                reward_tensor[i, pos] += total_bonus[i]
+                reward_tensor[index, pos] += total_bonus[index]
 
-    reward_extra_infos_dict["rank_bonus"] = rank_b.tolist()
-    reward_extra_infos_dict["pair_bonus"] = pair_b.tolist()
+    reward_extra_infos_dict["rank_bonus"] = rank_bonus.tolist()
+    reward_extra_infos_dict["pair_bonus"] = pair_bonus.tolist()
     reward_extra_infos_dict["pair_count"] = [float(pair_count)] * n
-    reward_extra_infos_dict["clean_minus_noisy_conf"] = [cmn_conf] * n
+    reward_extra_infos_dict["clean_minus_noisy_conf"] = [clean_minus_noisy_conf] * n
 
     valid_mask = confs >= 0
     if valid_mask.sum() > 0:
-        v_confs, v_accs = confs[valid_mask], metric_accs[valid_mask]
-        reward_extra_infos_dict["ece"] = [_binary_ece(v_confs, v_accs)] * n
-        reward_extra_infos_dict["mean_confidence"] = [float(v_confs.mean())] * n
-        reward_extra_infos_dict["high_conf_error_ratio"] = [_high_confidence_error_ratio(v_confs, v_accs)] * n
-        reward_extra_infos_dict["overconfidence_rate"] = [
-            float(((v_accs < 0.5) & (v_confs > 0.5)).mean())
-        ] * n
-        reward_extra_infos_dict["underconfidence_rate"] = [
-            float(((v_accs > 0.5) & (v_confs < 0.5)).mean())
-        ] * n
-        ece_bins = _ece_per_bin(v_confs, v_accs)
-        for b in ece_bins:
-            tag = f"ece_bin_{b['lo']:.1f}_{b['hi']:.1f}"
-            reward_extra_infos_dict[f"{tag}/count"] = [b["count"]] * n
-            reward_extra_infos_dict[f"{tag}/avg_conf"] = [b["avg_conf"]] * n
-            reward_extra_infos_dict[f"{tag}/avg_acc"] = [b["avg_acc"]] * n
-            reward_extra_infos_dict[f"{tag}/gap"] = [b["gap"]] * n
+        valid_confs, valid_accs = confs[valid_mask], metric_accs[valid_mask]
+        reward_extra_infos_dict["ece"] = [_binary_ece(valid_confs, valid_accs)] * n
+        reward_extra_infos_dict["mean_confidence"] = [float(valid_confs.mean())] * n
+        reward_extra_infos_dict["high_conf_error_ratio"] = [_high_confidence_error_ratio(valid_confs, valid_accs)] * n
+        reward_extra_infos_dict["overconfidence_rate"] = [float(((valid_accs < 0.5) & (valid_confs > 0.5)).mean())] * n
+        reward_extra_infos_dict["underconfidence_rate"] = [float(((valid_accs > 0.5) & (valid_confs < 0.5)).mean())] * n
+        ece_bins = _ece_per_bin(valid_confs, valid_accs)
+        for entry in ece_bins:
+            tag = f"ece_bin_{entry['lo']:.1f}_{entry['hi']:.1f}"
+            reward_extra_infos_dict[f"{tag}/count"] = [entry["count"]] * n
+            reward_extra_infos_dict[f"{tag}/avg_conf"] = [entry["avg_conf"]] * n
+            reward_extra_infos_dict[f"{tag}/avg_acc"] = [entry["avg_acc"]] * n
+            reward_extra_infos_dict[f"{tag}/gap"] = [entry["gap"]] * n
 
-        # --- Enhanced batch-level metrics for case study ---
-        # Accuracy stats
-        reward_extra_infos_dict["mean_accuracy"] = [float(v_accs.mean())] * n
-        reward_extra_infos_dict["accuracy_std"] = [float(v_accs.std())] * n
-        reward_extra_infos_dict["confidence_std"] = [float(v_confs.std())] * n
+        reward_extra_infos_dict["mean_accuracy"] = [float(valid_accs.mean())] * n
+        reward_extra_infos_dict["accuracy_std"] = [float(valid_accs.std())] * n
+        reward_extra_infos_dict["confidence_std"] = [float(valid_confs.std())] * n
 
-        # Confidence-accuracy correlation (Kendall's tau) - key calibration signal
-        if len(v_confs) >= 5 and scipy_stats is not None:
+        if len(valid_confs) >= 5 and scipy_stats is not None:
             try:
-                tau, tau_p = scipy_stats.kendalltau(v_confs, v_accs)
+                tau, tau_p = scipy_stats.kendalltau(valid_confs, valid_accs)
                 reward_extra_infos_dict["kendall_tau"] = [float(tau) if not np.isnan(tau) else 0.0] * n
                 reward_extra_infos_dict["kendall_tau_pvalue"] = [float(tau_p) if not np.isnan(tau_p) else 1.0] * n
             except Exception:
                 reward_extra_infos_dict["kendall_tau"] = [0.0] * n
                 reward_extra_infos_dict["kendall_tau_pvalue"] = [1.0] * n
 
-            # Pearson correlation
             try:
-                r, r_p = scipy_stats.pearsonr(v_confs, v_accs)
-                reward_extra_infos_dict["pearson_r"] = [float(r) if not np.isnan(r) else 0.0] * n
+                pearson_r, _ = scipy_stats.pearsonr(valid_confs, valid_accs)
+                reward_extra_infos_dict["pearson_r"] = [float(pearson_r) if not np.isnan(pearson_r) else 0.0] * n
             except Exception:
                 reward_extra_infos_dict["pearson_r"] = [0.0] * n
         else:
@@ -295,48 +292,40 @@ def apply_reward_shaping(
             reward_extra_infos_dict["kendall_tau_pvalue"] = [1.0] * n
             reward_extra_infos_dict["pearson_r"] = [0.0] * n
 
-        # Brier score: mean (conf - acc)^2
-        brier = float(((v_confs - v_accs) ** 2).mean())
+        brier = float(((valid_confs - valid_accs) ** 2).mean())
         reward_extra_infos_dict["brier_score"] = [brier] * n
+        reward_extra_infos_dict["conf_p10"] = [float(np.percentile(valid_confs, 10))] * n
+        reward_extra_infos_dict["conf_p50"] = [float(np.percentile(valid_confs, 50))] * n
+        reward_extra_infos_dict["conf_p90"] = [float(np.percentile(valid_confs, 90))] * n
 
-        # Confidence distribution percentiles
-        reward_extra_infos_dict["conf_p10"] = [float(np.percentile(v_confs, 10))] * n
-        reward_extra_infos_dict["conf_p50"] = [float(np.percentile(v_confs, 50))] * n
-        reward_extra_infos_dict["conf_p90"] = [float(np.percentile(v_confs, 90))] * n
+        format_ok = np.asarray(reward_extra_infos_dict.get("format_ok", [1.0] * n), dtype=np.float64)
+        reward_extra_infos_dict["format_rate"] = [float(format_ok.mean())] * n
 
-        # Format compliance rate
-        fmt_ok = np.asarray(reward_extra_infos_dict.get("format_ok", [1.0] * n), dtype=np.float64)
-        reward_extra_infos_dict["format_rate"] = [float(fmt_ok.mean())] * n
+        think_lengths = reward_extra_infos_dict.get("think_length", None)
+        if think_lengths is not None and len(think_lengths) == n:
+            think_lengths = np.asarray(think_lengths, dtype=np.float64)
+            reward_extra_infos_dict["mean_think_length"] = [float(think_lengths.mean())] * n
+            reward_extra_infos_dict["think_length_std"] = [float(think_lengths.std())] * n
 
-        # Think length stats (if available)
-        think_lens = reward_extra_infos_dict.get("think_length", None)
-        if think_lens is not None and len(think_lens) == n:
-            tl = np.asarray(think_lens, dtype=np.float64)
-            reward_extra_infos_dict["mean_think_length"] = [float(tl.mean())] * n
-            reward_extra_infos_dict["think_length_std"] = [float(tl.std())] * n
+        response_lengths = reward_extra_infos_dict.get("response_length", None)
+        if response_lengths is not None and len(response_lengths) == n:
+            response_lengths = np.asarray(response_lengths, dtype=np.float64)
+            reward_extra_infos_dict["mean_response_length"] = [float(response_lengths.mean())] * n
 
-        # Response length stats (if available)
-        resp_lens = reward_extra_infos_dict.get("response_length", None)
-        if resp_lens is not None and len(resp_lens) == n:
-            rl = np.asarray(resp_lens, dtype=np.float64)
-            reward_extra_infos_dict["mean_response_length"] = [float(rl.mean())] * n
-
-        # Per-group (prompt) accuracy/confidence variance - diversity signal
         if len(groups) > 0:
             group_acc_vars, group_conf_vars = [], []
             rank_violations = 0
             rank_total = 0
-            for idxs in groups:
-                ga, gc = metric_accs[idxs], confs[idxs]
-                gc_valid = gc[gc >= 0]
-                ga_valid = ga[gc >= 0]
-                if len(gc_valid) > 1:
-                    group_acc_vars.append(float(ga_valid.var()))
-                    group_conf_vars.append(float(gc_valid.var()))
-                    # Count rank violations: higher conf but lower acc
-                    for i in range(len(gc_valid)):
-                        for j in range(i + 1, len(gc_valid)):
-                            if (gc_valid[i] - gc_valid[j]) * (ga_valid[i] - ga_valid[j]) < 0:
+            for indices in groups:
+                group_acc, group_conf = metric_accs[indices], confs[indices]
+                valid_group_conf = group_conf[group_conf >= 0]
+                valid_group_acc = group_acc[group_conf >= 0]
+                if len(valid_group_conf) > 1:
+                    group_acc_vars.append(float(valid_group_acc.var()))
+                    group_conf_vars.append(float(valid_group_conf.var()))
+                    for i in range(len(valid_group_conf)):
+                        for j in range(i + 1, len(valid_group_conf)):
+                            if (valid_group_conf[i] - valid_group_conf[j]) * (valid_group_acc[i] - valid_group_acc[j]) < 0:
                                 rank_violations += 1
                             rank_total += 1
             if group_acc_vars:

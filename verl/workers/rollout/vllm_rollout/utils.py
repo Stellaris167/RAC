@@ -18,7 +18,7 @@ import os
 import platform
 import signal
 import threading
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Any, Literal, Optional, get_args
 
 import torch
@@ -119,6 +119,25 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def _patch_internvl_model_for_vllm(model, img_context_token_id: Optional[int] = None) -> bool:
+    from verl.models.transformers.monkey_patch import _patch_internvl_forward
+
+    patched = _patch_internvl_forward(model)
+    if not patched:
+        return False
+
+    if img_context_token_id is None:
+        raise ValueError("InternVL vLLM worker requires img_context_token_id for monkey patching.")
+
+    from verl.utils.internvl_processor import bind_internvl_img_context_token_id
+
+    bind_internvl_img_context_token_id(
+        model,
+        processor=SimpleNamespace(image_context_token_id=int(img_context_token_id)),
+    )
+    return True
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -170,7 +189,8 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, img_context_token_id: Optional[int] = None):
+        _patch_internvl_model_for_vllm(self.model_runner.model, img_context_token_id=img_context_token_id)
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model
@@ -373,26 +393,23 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
         List of CLI argument strings
     """
     cli_args = []
-
-    def _to_cli_flag(key: str) -> str:
-        return f"--{key.replace('_', '-')}"
-
     for k, v in config.items():
+        option = f"--{k.replace('_', '-')}"
         if v is None:
             continue
         if isinstance(v, bool):
             if v:
-                cli_args.append(_to_cli_flag(k))
+                cli_args.append(option)
         elif isinstance(v, list):
             if not v:
                 # Skip empty lists - vLLM uses nargs="+" which requires at least one value
                 continue
             # Lists need to be expanded as multiple separate arguments
             # e.g., --cuda-graph-sizes 1 2 4 8 becomes ['--cuda-graph-sizes', '1', '2', '4', '8']
-            cli_args.append(_to_cli_flag(k))
+            cli_args.append(option)
             cli_args.extend([str(item) for item in v])
         else:
-            cli_args.append(_to_cli_flag(k))
+            cli_args.append(option)
             # Use json.dumps for dict to ensure valid JSON format
             cli_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
     return cli_args

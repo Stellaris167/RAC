@@ -105,3 +105,33 @@ def need_critic(config: DictConfig) -> bool:
             stacklevel=2,
         )
         return False
+
+
+def should_run_initial_validation(config: DictConfig) -> bool:
+    """Run validation before training only when validation-only mode is requested."""
+    return bool(config.trainer.get("val_only", False))
+
+
+def resolve_validation_batch_size(config: DictConfig, val_dataset_size: int) -> int:
+    """Resolve validation batch size without defaulting to the entire validation set.
+
+    Historically, leaving data.val_batch_size unset caused validation to run the
+    full validation split as a single batch. That is unsafe for large multimodal
+    eval sets and can stall rollout generation or Ray actor heartbeats.
+
+    When val_batch_size is unspecified, fall back to the generation batch size
+    used for training data loading, then cap by the validation dataset size.
+    """
+    explicit_val_batch_size = config.data.get("val_batch_size", None)
+    if explicit_val_batch_size is not None:
+        return int(explicit_val_batch_size)
+
+    fallback_batch_size = config.data.get("gen_batch_size", None)
+    if fallback_batch_size is None:
+        fallback_batch_size = config.data.train_batch_size
+
+    fallback_batch_size = int(fallback_batch_size)
+    if fallback_batch_size <= 0:
+        return int(val_dataset_size)
+
+    return min(int(val_dataset_size), fallback_batch_size)

@@ -39,6 +39,8 @@ CONTROL_METHOD_CONCURRENCY = 16
 class TokenOutput(BaseModel):
     token_ids: list[int]
     """response token ids"""
+    prompt_token_ids: Optional[list[int]] = None
+    """prompt token ids actually served by the rollout backend"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
     routed_experts: Optional[Any] = None

@@ -1,193 +1,174 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Unified launcher for confidence RL experiments.
-#
-# Experiment groups (8 total):
-#   1. baseline:   clean training, no rank/pair bonus
-#   2. ranking:    clean training, rank bonus only
-#   3. pair_T0.2:  pair training at severity 1, rank + pair bonus
-#   4. pair_T0.4:  pair training at severity 2
-#   5. pair_T0.6:  pair training at severity 3
-#   6. pair_T0.8:  pair training at severity 4
-#   7. pair_T1.0:  pair training at severity 5
-#   8. pair_main:  pair training with noisy mix = 50% T0.2 + 40% T0.4 + 10% T0.6
-#
-# Test set is unified across all experiments:
-#   6 benchmarks × 6 conditions (clean + T0.2~T1.0) = 36 test sets
-#
-# Usage:
-#   EXP=baseline  bash run_internvl3_5_8b_grpo.sh
-#   EXP=ranking   bash run_internvl3_5_8b_grpo.sh
-#   EXP=pair_T0.2 bash run_internvl3_5_8b_grpo.sh
-# =============================================================================
-set -xeuo pipefail
+set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DATA_ROOT="/home/yby/raccoon/datasets"
-PYTHON_BIN=${PYTHON_BIN:-/home/yby/miniforge3/envs/mllm_v2/bin/python}
-MODEL=${MODEL:-/home/yby/models/InternVL3.5-8B}
+PYTHON_BIN=${PYTHON_BIN:-python}
+MODEL=${MODEL:-OpenGVLab/InternVL3_5-8B}
 ALGO=${ALGO:-grpo}
+: "${DATA_ROOT:=}"
 
-# ---- Experiment configuration ----
-EXP=${EXP:-baseline}
+if [[ -z "$DATA_ROOT" ]]; then
+  echo "Set DATA_ROOT to a local RAC dataset directory." >&2
+  exit 1
+fi
+
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "DATA_ROOT does not exist: $DATA_ROOT" >&2
+  exit 1
+fi
+
+join_path() {
+  local root="${1%/}"
+  local rel="${2#/}"
+  printf '%s/%s' "$root" "$rel"
+}
+
+build_data_path() {
+  join_path "$DATA_ROOT" "$1"
+}
+
+build_val_files() {
+  local benchmarks=(
+    m3cot
+    mathverse
+    mathvision
+    mmmu
+    scienceqa
+    we_math
+  )
+  local severities=("" "_T0.2" "_T0.4" "_T0.6" "_T0.8" "_T1.0")
+  local files=()
+  local benchmark severity suffix file
+
+  for benchmark in "${benchmarks[@]}"; do
+    for severity in "${severities[@]}"; do
+      suffix="_test_processed${severity}"
+      file=$(build_data_path "${benchmark}${suffix}/test.parquet")
+      files+=("\"${file}\"")
+    done
+  done
+
+  local joined=""
+  for file in "${files[@]}"; do
+    joined+="${file},"
+  done
+  printf '[%s]' "${joined%,}"
+}
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "PYTHON_BIN not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+EXP=${EXP:-pair_main}
 
 case $EXP in
   baseline)
-    MODE=clean
-    TRAIN_DATA="$DATA_ROOT/train/train.parquet"
+    TRAIN_DATA=$(build_data_path "train/train.parquet")
     RANK_COEF=0.0
     CORR_COEF=0.0
     ;;
   ranking)
-    MODE=clean
-    TRAIN_DATA="$DATA_ROOT/train/train.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.0
     ;;
   pair_T0.2)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.2.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_T0.2.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.3
     ;;
   pair_T0.4)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.4.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_T0.4.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.3
     ;;
   pair_T0.6)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.6.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_T0.6.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.3
     ;;
   pair_T0.8)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_T0.8.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_T0.8.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.3
     ;;
   pair_T1.0)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_T1.0.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_T1.0.parquet")
+    RANK_COEF=0.2
+    CORR_COEF=0.3
+    ;;
+  pair)
+    TRAIN_DATA=$(build_data_path "train/train_pair_main.parquet")
+    RANK_COEF=0.0
     CORR_COEF=0.3
     ;;
   pair_main)
-    MODE=pair
-    TRAIN_DATA="$DATA_ROOT/train/train_pair_main.parquet"
-    RANK_COEF=0.1
+    TRAIN_DATA=$(build_data_path "train/train_pair_main.parquet")
+    RANK_COEF=0.2
     CORR_COEF=0.3
     ;;
   *)
-    echo "Unknown EXP=$EXP. Use: baseline, ranking, pair_T0.2, pair_T0.4, pair_T0.6, pair_T0.8, pair_T1.0, pair_main"
+    echo "Unknown EXP=$EXP. Use: baseline, ranking, pair_T0.2, pair_T0.4, pair_T0.6, pair_T0.8, pair_T1.0, pair, pair_main"
     exit 1
     ;;
 esac
 
-LEN_COEF=${LEN_COEF:-0.0}
+VAL_FILES=$(build_val_files)
+TRAINER_LOGGER=${TRAINER_LOGGER:-"['console','wandb']"}
+VALIDATION_DIR=${VALIDATION_DIR:-$(join_path "$PROJECT_DIR" "logs/val_dumps/intern3.5vl8b-${ALGO}-${EXP}")}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-$(join_path "$PROJECT_DIR" "checkpoints/intern3.5vl8b-${ALGO}-${EXP}")}
 
-# ---- Unified test sets: 6 benchmarks × 6 conditions (clean + 5 severities) ----
-VAL_FILES="[\
-$DATA_ROOT/m3cot_test_processed/test.parquet,\
-$DATA_ROOT/m3cot_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/m3cot_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/m3cot_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/m3cot_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/m3cot_test_processed_T1.0/test.parquet,\
-$DATA_ROOT/mathverse_test_processed/test.parquet,\
-$DATA_ROOT/mathverse_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/mathverse_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/mathverse_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/mathverse_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/mathverse_test_processed_T1.0/test.parquet,\
-$DATA_ROOT/mathvision_test_processed/test.parquet,\
-$DATA_ROOT/mathvision_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/mathvision_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/mathvision_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/mathvision_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/mathvision_test_processed_T1.0/test.parquet,\
-$DATA_ROOT/mmmu_test_processed/test.parquet,\
-$DATA_ROOT/mmmu_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/mmmu_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/mmmu_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/mmmu_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/mmmu_test_processed_T1.0/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/scienceqa_test_processed_T1.0/test.parquet,\
-$DATA_ROOT/we_math_test_processed/test.parquet,\
-$DATA_ROOT/we_math_test_processed_T0.2/test.parquet,\
-$DATA_ROOT/we_math_test_processed_T0.4/test.parquet,\
-$DATA_ROOT/we_math_test_processed_T0.6/test.parquet,\
-$DATA_ROOT/we_math_test_processed_T0.8/test.parquet,\
-$DATA_ROOT/we_math_test_processed_T1.0/test.parquet\
-]"
-
-export WANDB_API_KEY="8cdd1a52817745e3e2df67a50ead3eb0c0a63656"
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 if [[ "${VLLM_ATTENTION_BACKEND:-}" == "XFORMERS" || "${VLLM_ATTENTION_BACKEND:-}" == "TORCH_SDPA" ]]; then
   unset VLLM_ATTENTION_BACKEND
 fi
-export HF_HOME=${HF_HOME:-/home/yby/.cache/huggingface}
-export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
-export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-0}
-export VERL_DEBUG_PRINT_SAMPLES=${VERL_DEBUG_PRINT_SAMPLES:-2}
-export VERL_DEBUG_MAX_STEPS=${VERL_DEBUG_MAX_STEPS:-1}
-export VERL_DEBUG_TEXT_CHARS=${VERL_DEBUG_TEXT_CHARS:-12000}
-export VERIFY_REMOTE_MODEL_IMPORT=${VERIFY_REMOTE_MODEL_IMPORT:-1}
 
-REWARD_DEBUG_DIR=${REWARD_DEBUG_DIR:-$PROJECT_DIR/logs/reward_debug/internvl3.5-8b-${ALGO}-${EXP}}
-
-if [[ "$VERIFY_REMOTE_MODEL_IMPORT" == "1" ]]; then
-  "$PYTHON_BIN" - <<'PY'
-import os
-
-from transformers import AutoConfig
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-model_path = os.environ["MODEL"]
-config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-auto_map = getattr(config, "auto_map", {}) or {}
-print(f"[model-import-check] model_path={model_path}")
-print(f"[model-import-check] auto_map_keys={sorted(auto_map)}")
-for key, value in sorted(auto_map.items()):
-    if isinstance(value, str):
-        cls = get_class_from_dynamic_module(value, model_path)
-        print(f"[model-import-check] {key} -> {cls}")
-PY
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  cat <<EOF
+PROJECT_DIR=$PROJECT_DIR
+PYTHON_BIN=$PYTHON_BIN
+MODEL=$MODEL
+DATA_ROOT=$DATA_ROOT
+TRAIN_DATA=$TRAIN_DATA
+VAL_FILES=$VAL_FILES
+TRAINER_LOGGER=$TRAINER_LOGGER
+VALIDATION_DIR=$VALIDATION_DIR
+CHECKPOINT_DIR=$CHECKPOINT_DIR
+EOF
+  exit 0
 fi
 
-HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ALGO \
-    data.train_files=$TRAIN_DATA \
+    data.train_files=\"$TRAIN_DATA\" \
     data.val_files=$VAL_FILES \
-    data.custom_cls.path=$PROJECT_DIR/verl/trainer/reward_fn/confidence_dataset.py \
+    data.custom_cls.path=\"$PROJECT_DIR/verl/trainer/reward_fn/confidence_dataset.py\" \
     data.custom_cls.name=ConfidenceRLDataset \
-    data.train_batch_size=1200 \
-    data.max_prompt_length=4096 \
+    data.train_batch_size=512 \
+    data.max_prompt_length=2500 \
     data.max_response_length=3072 \
-    data.val_batch_size=2400 \
     data.prompt_key=message_internvl \
+    data.trust_remote_code=true \
     data.reward_fn_key=data_source \
-    +data.inject_confidence=true \
-    +data.split_data_source_by_corruption=true \
+    ++data.max_model_len=60000 \
+    ++data.inject_confidence=true \
+    ++data.split_data_source_by_corruption=true \
     data.image_key=images \
-    actor_rollout_ref.model.path=$MODEL \
+    actor_rollout_ref.model.path=\"$MODEL\" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.trust_remote_code=true \
     actor_rollout_ref.model.use_remove_padding=true \
-    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+    ++actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
     actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=49152 \
     actor_rollout_ref.actor.optim.min_lr_ratio=0.5 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=300 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
     actor_rollout_ref.actor.use_torch_compile=false \
@@ -196,7 +177,6 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=0.005 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.rollout.name=vllm \
@@ -204,36 +184,31 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.top_k=20 \
-    +actor_rollout_ref.rollout.repetition_penalty=1.10 \
+    ++actor_rollout_ref.rollout.repetition_penalty=1.10 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.max_num_seqs=256 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=true \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20 \
-    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=20 \
-    reward.custom_reward_function.path=$PROJECT_DIR/verl/trainer/reward_fn/confidence_reward.py \
-    reward.custom_reward_function.name=compute_score \
-    +reward.custom_reward_function.reward_kwargs.format_reward_coef=0.3 \
-    +reward.custom_reward_function.reward_kwargs.format_reward_warmup_start=1.0 \
-    +reward.custom_reward_function.reward_kwargs.format_reward_warmup_steps=10 \
-    +reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1 \
-    reward.reward_manager.source=register \
-    reward.reward_manager.name=naive \
-    +reward.reward_manager.dump_pairs=true \
-    +reward.reward_manager.dump_dir=$REWARD_DEBUG_DIR \
-    +reward.reward_manager.dump_max_samples_per_worker=16 \
-    +reward.reward_shaping.path=$PROJECT_DIR/verl/trainer/reward_fn/reward_shaping.py \
-    +reward.reward_shaping.name=apply_reward_shaping \
-    +reward.reward_shaping.rank_reward_coef=$RANK_COEF \
-    +reward.reward_shaping.rank_reward_margin=0.05 \
-    +reward.reward_shaping.corr_reward_coef=$CORR_COEF \
-    +reward.reward_shaping.corr_reward_margin=0.05 \
-    +reward.reward_shaping.corr_reward_alpha=0.1 \
-    +reward.reward_shaping.len_reward_coef=$LEN_COEF \
+    ++reward.custom_reward_function.path=\"$PROJECT_DIR/verl/trainer/reward_fn/confidence_reward.py\" \
+    ++reward.custom_reward_function.name=compute_score \
+    ++reward.custom_reward_function.reward_kwargs.format_reward_coef=0.3 \
+    ++reward.custom_reward_function.reward_kwargs.format_reward_warmup_start=1.0 \
+    ++reward.custom_reward_function.reward_kwargs.format_reward_warmup_steps=10 \
+    ++reward.custom_reward_function.reward_kwargs.tail_text_penalty_coef=0.1 \
+    ++reward.reward_manager.source=register \
+    ++reward.reward_manager.name=naive \
+    ++reward.reward_shaping.path=\"$PROJECT_DIR/verl/trainer/reward_fn/reward_shaping.py\" \
+    ++reward.reward_shaping.name=apply_reward_shaping \
+    ++reward.reward_shaping.rank_reward_coef=$RANK_COEF \
+    ++reward.reward_shaping.rank_reward_margin=0.05 \
+    ++reward.reward_shaping.corr_reward_coef=$CORR_COEF \
+    ++reward.reward_shaping.corr_reward_margin=0.05 \
+    ++reward.reward_shaping.corr_reward_alpha=0.1 \
+    ++reward.reward_shaping.len_reward_coef=0.0 \
     algorithm.use_kl_in_reward=false \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -241,12 +216,12 @@ HYDRA_FULL_ERROR=1 "$PYTHON_BIN" -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=20 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=true \
     trainer.total_epochs=2 \
-    trainer.save_freq=12 \
+    trainer.save_freq=6 \
     trainer.test_freq=6 \
     trainer.project_name=confidence-rl \
-    trainer.experiment_name=internvl3.5-8b-${ALGO}-${EXP} \
-    trainer.logger="['console','wandb']" \
-    trainer.n_gpus_per_node=${N_GPUS_PER_NODE:-8} \
-    trainer.nnodes=${NNODES:-3} \
-    trainer.validation_data_dir=$PROJECT_DIR/logs/val_dumps/internvl3.5-8b-${ALGO}-${EXP} \
-    trainer.default_local_dir=$PROJECT_DIR/checkpoints/internvl3.5-8b-${ALGO}-${EXP}
+    trainer.experiment_name=intern3.5vl8b-${ALGO}-${EXP} \
+    trainer.logger=$TRAINER_LOGGER \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.validation_data_dir=\"$VALIDATION_DIR\" \
+    trainer.default_local_dir=\"$CHECKPOINT_DIR\"

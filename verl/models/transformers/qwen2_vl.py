@@ -42,22 +42,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-_flash_supports_window_size = False
-_flash_supports_deterministic = False
-_flash_use_top_left_mask = False
-_FLASH_ATTN_READY = False
-
-
 if is_flash_attn_2_available():
-    try:
-        from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 
-        _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
-        _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
-        _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
-        _FLASH_ATTN_READY = True
-    except Exception as e:
-        logger.warning(f"flash_attn import failed, fallback to non-flash attention path: {e}")
+    _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
+    _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
+    _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
 if is_npu_available:
     from transformers.integrations.npu_flash_attention import npu_flash_attn_func as flash_attn_func
@@ -67,13 +57,8 @@ if is_npu_available:
     _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
     _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
     _flash_use_top_left_mask = flash_attn_supports_top_left_mask()
-    _FLASH_ATTN_READY = True
 
 _flash_deterministic_enabled = os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
-
-
-def is_flash_attn_ready() -> bool:
-    return _FLASH_ATTN_READY
 
 
 def get_rope_index(

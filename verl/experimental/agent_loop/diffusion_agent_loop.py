@@ -30,7 +30,6 @@ from verl.experimental.agent_loop.agent_loop import (
     DictConfigWrap,
     _agent_loop_registry,
     _get_rollout_and_model_config,
-    _safe_left_truncate_visual_token_runs,
 )
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
@@ -228,21 +227,9 @@ class DiffusionAgentLoopWorker:
 
         extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
-        prompt_ids = list(output.prompt_ids)
-        if len(prompt_ids) > self.rollout_config.prompt_length:
-            original_len = len(prompt_ids)
-            prompt_ids = _safe_left_truncate_visual_token_runs(
-                self.processor, prompt_ids, self.rollout_config.prompt_length
-            )
-            logger.warning(
-                "Postprocess truncated diffusion prompt_ids from %d to %d tokens before batching.",
-                original_len,
-                len(prompt_ids),
-            )
-
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": prompt_ids},
+            {"input_ids": output.prompt_ids},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
             return_tensors="pt",
@@ -363,8 +350,6 @@ class DiffusionAgentLoopWorker:
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            if key in non_tensor_batch:
-                continue
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them

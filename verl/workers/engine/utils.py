@@ -14,7 +14,6 @@
 
 import os
 import random
-from math import ceil
 
 import numpy as np
 import torch
@@ -89,13 +88,10 @@ def prepare_micro_batches(
     else:
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
-        assert total_data_size % force_group_size == 0, (
-            "data size must be divisible by force_group_size"
+        assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
+            "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
         )
-        micro_batch_group_size = force_group_size * micro_batch_size_per_gpu
-        num_micro_batches = ceil(total_data_size / micro_batch_group_size)
-        micro_batches = tu.split_tensordict(data, split_size=micro_batch_group_size)
-        assert len(micro_batches) == num_micro_batches
+        micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
         batch_idx_list = None
     return micro_batches, batch_idx_list
 

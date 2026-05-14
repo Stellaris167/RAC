@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch.nn import CrossEntropyLoss
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
 
 
 def internvl_chat_forward(
@@ -109,6 +109,11 @@ def internvl_chat_forward(
     input_embeds = input_embeds.reshape(B * N, C)
 
     flat_input_ids = input_ids.reshape(B * N)
+    if getattr(self, "img_context_token_id", None) is None:
+        raise RuntimeError(
+            "InternVL img_context_token_id is not initialized. "
+            "Bind tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>') to the model before forward."
+        )
     selected = flat_input_ids == self.img_context_token_id
     try:
         input_embeds[selected] = input_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
@@ -151,3 +156,44 @@ def internvl_chat_forward(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
     )
+
+
+def internvl_vision_encoder_forward(
+    self,
+    inputs_embeds,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, BaseModelOutput]:
+    """InternVL vision encoder forward that honors HF checkpointing hooks.
+
+    Upstream InternVL calls torch.utils.checkpoint.checkpoint() directly, which
+    bypasses transformers' `_gradient_checkpointing_func` and ignores
+    `use_reentrant=False`. Under FSDP/full-shard param offload this can leave
+    vision-layer parameter views in an invalid state during checkpoint
+    recomputation.
+    """
+    output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    encoder_states = () if output_hidden_states else None
+    hidden_states = inputs_embeds
+    gradient_checkpointing_func = getattr(self, "_gradient_checkpointing_func", torch.utils.checkpoint.checkpoint)
+    use_gradient_checkpointing = bool(getattr(self, "gradient_checkpointing", False)) and bool(
+        getattr(self, "training", False)
+    )
+
+    for encoder_layer in self.layers:
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+        if use_gradient_checkpointing:
+            hidden_states = gradient_checkpointing_func(encoder_layer.__call__, hidden_states)
+        else:
+            hidden_states = encoder_layer(hidden_states)
+
+    if output_hidden_states:
+        encoder_states = encoder_states + (hidden_states,)
+
+    if not return_dict:
+        return tuple(v for v in [hidden_states, encoder_states] if v is not None)
+
+    return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)

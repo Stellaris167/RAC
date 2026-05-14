@@ -13,9 +13,6 @@
 # limitations under the License.
 
 
-import logging
-import os
-
 from msgspec import field
 from packaging import version as vs
 
@@ -29,9 +26,6 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 
 from verl.third_party.vllm import get_version
-
-
-logger = logging.getLogger(__name__)
 
 
 class TensorLoRARequest(LoRARequest):
@@ -132,55 +126,3 @@ class VLLMHijack:
 def is_version_ge(pkg: str = "vllm", minver: str = "0.7.3"):
     """check if the package version is greater than or equal to the minimum version"""
     return vs.parse(get_version(pkg)) >= vs.parse(minver)
-
-
-def normalize_vllm_attention_backend_env() -> str | None:
-    """Normalize or clear VLLM_ATTENTION_BACKEND for cross-version compatibility.
-
-    In vLLM 0.14.x, values like ``XFORMERS`` are invalid, and ``TORCH_SDPA`` is
-    a special enum tag reserved for ViT attention rather than a runnable generic
-    rollout backend. For those cases we clear the env var and let vLLM auto-pick
-    a supported backend such as ``FLASH_ATTN`` or ``FLASHINFER``.
-    """
-
-    backend = os.getenv("VLLM_ATTENTION_BACKEND")
-    if not backend:
-        return None
-
-    normalized_backend = backend.strip().upper()
-    if not normalized_backend:
-        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        return None
-
-    if normalized_backend == "XFORMERS":
-        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        logger.warning(
-            "Cleared VLLM_ATTENTION_BACKEND=%s because XFORMERS is not supported by vLLM; using auto-selected backend.",
-            backend,
-        )
-        return None
-
-    try:
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    except Exception:
-        if normalized_backend != backend:
-            os.environ["VLLM_ATTENTION_BACKEND"] = normalized_backend
-        return normalized_backend
-
-    if normalized_backend not in AttentionBackendEnum.__members__:
-        return backend
-
-    enum_backend = AttentionBackendEnum[normalized_backend]
-    if not getattr(enum_backend, "value", None):
-        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
-        logger.warning(
-            "Cleared VLLM_ATTENTION_BACKEND=%s because %s is not a runnable generic vLLM backend in vLLM %s; using auto-selected backend.",
-            backend,
-            normalized_backend,
-            get_version("vllm"),
-        )
-        return None
-
-    if normalized_backend != backend:
-        os.environ["VLLM_ATTENTION_BACKEND"] = normalized_backend
-    return normalized_backend

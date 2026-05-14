@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    format_validation_metric_dict,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
@@ -57,12 +58,14 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
     need_reward_model,
     need_teacher_policy,
+    resolve_validation_batch_size,
+    should_run_initial_validation,
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import load_class_from_fqn, load_extern_object
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
@@ -71,70 +74,6 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
-
-
-def _get_debug_env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value in (None, ""):
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        print(f"Invalid {name}={value!r}; falling back to {default}", flush=True)
-        return default
-
-
-def _safe_index(values: Any, index: int, default: Any = None) -> Any:
-    if values is None:
-        return default
-    try:
-        return values[index]
-    except Exception:
-        return default
-
-
-def _render_raw_prompt(raw_prompt: Any) -> str:
-    if isinstance(raw_prompt, str):
-        return raw_prompt
-    if not isinstance(raw_prompt, list):
-        return repr(raw_prompt)
-
-    rendered_messages = []
-    for message in raw_prompt:
-        if not isinstance(message, dict):
-            rendered_messages.append(repr(message))
-            continue
-        role = message.get("role", "unknown")
-        content = message.get("content", "")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = []
-            for item in content:
-                if not isinstance(item, dict):
-                    parts.append(repr(item))
-                    continue
-                item_type = item.get("type")
-                if item_type == "text":
-                    parts.append(str(item.get("text", "")))
-                elif item_type == "image":
-                    parts.append("<image>")
-                elif item_type == "video":
-                    parts.append("<video>")
-                else:
-                    parts.append(repr(item))
-            text = "".join(parts)
-        else:
-            text = repr(content)
-        rendered_messages.append(f"[{role}]\n{text}")
-    return "\n\n".join(rendered_messages)
-
-
-def _truncate_debug_text(value: Any, max_chars: int) -> str:
-    text = value if isinstance(value, str) else repr(value)
-    if max_chars > 0 and len(text) > max_chars:
-        return f"{text[:max_chars]}\n...[truncated {len(text) - max_chars} chars]"
-    return text
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -295,6 +234,25 @@ def compute_advantage(
     return data
 
 
+def load_reward_shaping_function(config):
+    reward_shaping_cfg = OmegaConf.select(config, "reward.reward_shaping")
+    if reward_shaping_cfg is None:
+        return None
+
+    reward_shaping_path = reward_shaping_cfg.get("path")
+    reward_shaping_name = reward_shaping_cfg.get("name")
+    if not reward_shaping_path or not reward_shaping_name:
+        return None
+
+    return load_extern_object(reward_shaping_path, reward_shaping_name)
+
+
+def maybe_apply_reward_shaping(reward_shaping_fn, reward_tensor, reward_extra_infos_dict, batch, config):
+    if reward_shaping_fn is None:
+        return reward_tensor, reward_extra_infos_dict
+    return reward_shaping_fn(reward_tensor, reward_extra_infos_dict, batch, config)
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -364,9 +322,6 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
-        self.debug_print_samples = max(_get_debug_env_int("VERL_DEBUG_PRINT_SAMPLES", 0), 0)
-        self.debug_max_steps = max(_get_debug_env_int("VERL_DEBUG_MAX_STEPS", 1), 0)
-        self.debug_text_chars = max(_get_debug_env_int("VERL_DEBUG_TEXT_CHARS", 12000), 0)
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -381,17 +336,11 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self.reward_shaping_fn = load_reward_shaping_function(self.config)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
-
-        self._reward_shaping_fn = None
-        _rs = self.config.get("reward", {}).get("reward_shaping", None)
-        if _rs and _rs.get("path"):
-            from verl.utils.import_utils import load_extern_object
-            self._reward_shaping_fn = load_extern_object(_rs.path, _rs.name)
-            print(f"Loaded reward shaping: {_rs.name} from {_rs.path}")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -436,9 +385,7 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
+        val_batch_size = resolve_validation_batch_size(self.config, len(self.val_dataset))
 
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
@@ -476,7 +423,7 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL with rich per-sample details for case study."""
+        """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
@@ -501,26 +448,7 @@ class RayPPOTrainer:
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        # Additionally dump a per-step summary CSV for quick analysis
-        summary_path = os.path.join(dump_path, "summary.csv")
-        is_new = not os.path.exists(summary_path)
-        summary_keys = ["step", "n_samples", "mean_score", "mean_acc", "mean_confidence",
-                        "ece", "brier_score", "format_rate", "kendall_tau",
-                        "overconfidence_rate", "underconfidence_rate", "high_conf_error_ratio",
-                        "mean_think_length", "mean_response_length"]
-        row = {"step": self.global_steps, "n_samples": n}
-        if scores:
-            row["mean_score"] = sum(scores) / len(scores)
-        for k in summary_keys[3:]:
-            vals = reward_extra_infos_dict.get(k, [])
-            if vals:
-                row[k] = vals[0]  # batch-level metrics are replicated
-        with open(summary_path, "a") as f:
-            if is_new:
-                f.write(",".join(summary_keys) + "\n")
-            f.write(",".join(str(row.get(k, "")) for k in summary_keys) + "\n")
-
-        print(f"Dumped {n} generations to {filename}")
+        print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -539,11 +467,6 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "data_source" in batch.non_tensor_batch:
-                data_sources = batch.non_tensor_batch["data_source"]
-                reward_extra_infos_to_dump["data_source"] = (
-                    data_sources.tolist() if hasattr(data_sources, "tolist") else list(data_sources)
-                )
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -598,76 +521,6 @@ class RayPPOTrainer:
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
-
-    def _maybe_log_step_debug(self, batch: DataProto, stage: str) -> None:
-        if self.debug_print_samples <= 0 or self.debug_max_steps <= 0 or self.global_steps > self.debug_max_steps:
-            return
-
-        try:
-            prompt_ids = batch.batch["prompts"]
-            response_ids = batch.batch["responses"]
-            attention_mask = batch.batch["attention_mask"]
-        except KeyError as exc:
-            print(
-                f"[verl-step-debug] skipped stage={stage} global_step={self.global_steps}: missing {exc}",
-                flush=True,
-            )
-            return
-
-        reward_models = batch.non_tensor_batch.get("reward_model")
-        raw_prompts = batch.non_tensor_batch.get("raw_prompt")
-        data_sources = batch.non_tensor_batch.get("data_source")
-        sample_count = min(self.debug_print_samples, len(batch))
-        prompt_width = prompt_ids.shape[-1]
-
-        print(
-            f"[verl-step-debug] stage={stage} global_step={self.global_steps} sample_count={sample_count}/{len(batch)}",
-            flush=True,
-        )
-        for sample_idx in range(sample_count):
-            valid_prompt_length = int(attention_mask[sample_idx][:prompt_width].sum().item())
-            valid_response_length = int(attention_mask[sample_idx][prompt_width:].sum().item())
-            valid_prompt_ids = (
-                prompt_ids[sample_idx][-valid_prompt_length:] if valid_prompt_length > 0 else prompt_ids[sample_idx][:0]
-            )
-            valid_response_ids = (
-                response_ids[sample_idx][:valid_response_length]
-                if valid_response_length > 0
-                else response_ids[sample_idx][:0]
-            )
-
-            prompt_text = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=False)
-            response_text = self.tokenizer.decode(valid_response_ids, skip_special_tokens=False)
-            raw_prompt = _safe_index(raw_prompts, sample_idx)
-            rendered_prompt = _render_raw_prompt(raw_prompt) if raw_prompt is not None else prompt_text
-            reward_model = _safe_index(reward_models, sample_idx, {})
-            ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else reward_model
-            data_source = _safe_index(data_sources, sample_idx, "<unknown>")
-
-            print(
-                f"[verl-step-debug][meta] stage={stage} global_step={self.global_steps} sample={sample_idx} data_source={data_source}",
-                flush=True,
-            )
-            print(
-                f"[verl-step-debug][prompt_raw] {_truncate_debug_text(rendered_prompt, self.debug_text_chars)}",
-                flush=True,
-            )
-            print(
-                f"[verl-step-debug][prompt_decoded] {_truncate_debug_text(prompt_text, self.debug_text_chars)}",
-                flush=True,
-            )
-            print(
-                f"[verl-step-debug][ground_truth] {_truncate_debug_text(ground_truth, self.debug_text_chars)}",
-                flush=True,
-            )
-            print(
-                f"[verl-step-debug][response] {_truncate_debug_text(response_text, self.debug_text_chars)}",
-                flush=True,
-            )
-            print(
-                f"[verl-step-debug][response_token_ids] {valid_response_ids.detach().cpu().tolist()}",
-                flush=True,
-            )
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -787,19 +640,15 @@ class RayPPOTrainer:
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        data_sources = np.concatenate(data_source_lst, axis=0) if data_source_lst else np.array([], dtype=object)
-
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
-            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            reward_extra_infos_to_dump["data_source"] = data_sources.tolist()
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
 
@@ -814,45 +663,12 @@ class RayPPOTrainer:
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
+        data_sources = np.concatenate(data_source_lst, axis=0)
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
-        # Accumulate per-dataset correct/total for weighted average
-        weighted_avg_accum = {}  # metric_name -> {correct: float, total: int}
-
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-            # Count unique UIDs for this data_source to compute weighted avg
-            if core_var in var2metric2val:
-                src_mask = np.array(data_sources) == data_source
-                src_uids = set(np.array(sample_uids)[src_mask])
-                n_prompts = len(src_uids)
-                for metric_name, metric_val in var2metric2val[core_var].items():
-                    if metric_name not in weighted_avg_accum:
-                        weighted_avg_accum[metric_name] = {"correct": 0.0, "total": 0}
-                    weighted_avg_accum[metric_name]["correct"] += metric_val * n_prompts
-                    weighted_avg_accum[metric_name]["total"] += n_prompts
-
-        # Weighted average across all benchmarks: total_correct / total_samples
-        for metric_name, accum in weighted_avg_accum.items():
-            if accum["total"] > 0:
-                metric_dict[f"val-core/weighted_avg/acc/{metric_name}"] = accum["correct"] / accum["total"]
+        metric_dict = format_validation_metric_dict(data_src2var2metric2val)
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -1009,7 +825,6 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
-        self.actor_rollout_wg.execute_all_sync("prepare_for_rollout_launch")
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -1084,27 +899,6 @@ class RayPPOTrainer:
 
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
-
-    def _cleanup_workers(self):
-        """Release GPU memory held by ray WorkerDict actors after training."""
-        import gc
-        for attr in ("actor_rollout_wg", "critic_wg", "reward_wg"):
-            wg = getattr(self, attr, None)
-            if wg is None:
-                continue
-            try:
-                if hasattr(wg, "terminate"):
-                    wg.terminate()
-                elif hasattr(wg, "destroy"):
-                    wg.destroy()
-            except Exception:
-                pass
-        gc.collect()
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1402,28 +1196,24 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
-                self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
-            )
-            tu.assign_non_tensor(batch_td, calculate_entropy=calculate_entropy, compute_loss=False)
+            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
+            entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
-            entropy = tu.get(output, "entropy") if calculate_entropy else None
 
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
+            entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
-            if calculate_entropy:
-                entropy = no_padding_2_padding(entropy, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
-            output_tensors = {"old_log_probs": log_probs.float()}
-            if calculate_entropy:
-                output_tensors["entropys"] = entropy.float()
             if routed_experts is not None:
-                output_tensors["routed_experts"] = routed_experts
-            old_log_prob = tu.get_tensordict(output_tensors)
+                old_log_prob = tu.get_tensordict(
+                    {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
+                )
+            else:
+                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1529,15 +1319,13 @@ class RayPPOTrainer:
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.config.trainer.get("val_before_train", True):
+        # Skip step-0 validation during normal training. Keep validation-only mode working.
+        if should_run_initial_validation(self.config):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+            return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
@@ -1633,7 +1421,6 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    self._maybe_log_step_debug(batch, stage="post_generate")
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
@@ -1665,11 +1452,13 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-
-                        if self._reward_shaping_fn is not None:
-                            reward_tensor, reward_extra_infos_dict = self._reward_shaping_fn(
-                                reward_tensor, reward_extra_infos_dict, batch, self.config
-                            )
+                        reward_tensor, reward_extra_infos_dict = maybe_apply_reward_shaping(
+                            self.reward_shaping_fn,
+                            reward_tensor,
+                            reward_extra_infos_dict,
+                            batch,
+                            self.config,
+                        )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1688,20 +1477,21 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            old_log_prob_metrics = {"perf/mfu/actor_infer": old_log_prob_mfu}
-                            if "entropys" in old_log_prob.batch:
-                                entropys = old_log_prob.batch["entropys"]
-                                response_masks = batch.batch["response_mask"]
-                                actor_config = self.config.actor_rollout_ref.actor
-                                entropy_agg = agg_loss(
-                                    loss_mat=entropys,
-                                    loss_mask=response_masks,
-                                    loss_agg_mode=actor_config.loss_agg_mode,
-                                    loss_scale_factor=actor_config.loss_scale_factor,
-                                )
-                                old_log_prob_metrics["actor/entropy"] = entropy_agg.detach().item()
-                                old_log_prob.batch.pop("entropys")
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            actor_config = self.config.actor_rollout_ref.actor
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=actor_config.loss_agg_mode,
+                                loss_scale_factor=actor_config.loss_scale_factor,
+                            )
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item(),
+                                "perf/mfu/actor_infer": old_log_prob_mfu,
+                            }
                             metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1862,23 +1652,8 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
-                if "actor/entropy" in metrics:
-                    metrics["train/entropy"] = metrics["actor/entropy"]
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-
-                # Train-time confidence/calibration metrics from reward shaping
-                _train_metric_keys = [
-                    "ece", "mean_accuracy", "mean_confidence", "format_rate",
-                    "high_conf_error_ratio", "overconfidence_rate", "underconfidence_rate",
-                    "brier_score", "kendall_tau", "pearson_r",
-                    "conf_p10", "conf_p50", "conf_p90",
-                ]
-                if reward_extra_infos_dict:
-                    for _mk in _train_metric_keys:
-                        _vals = reward_extra_infos_dict.get(_mk)
-                        if _vals and len(_vals) > 0:
-                            metrics[f"train/{_mk}"] = float(_vals[0])
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
@@ -1921,7 +1696,6 @@ class RayPPOTrainer:
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    self._cleanup_workers()
                     return
 
                 # this is experimental and may be changed/removed in the future

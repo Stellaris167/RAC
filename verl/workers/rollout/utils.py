@@ -17,14 +17,25 @@ import logging
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
-from verl.utils.model import get_text_config
 
 logger = logging.getLogger(__file__)
 
 
+def _get_text_model_config(hf_config):
+    for attr_name in ("text_config", "llm_config", "language_config"):
+        sub_config = getattr(hf_config, attr_name, None)
+        if sub_config is not None:
+            return sub_config
+    return None
+
+
 def get_max_position_embeddings(hf_config) -> int:
-    text_cfg = get_text_config(hf_config)
-    max_len = getattr(text_cfg, "max_position_embeddings", None)
+    max_len = getattr(hf_config, "max_position_embeddings", None)
+    if max_len is None:
+        text_config = _get_text_model_config(hf_config)
+        if text_config is not None:
+            max_len = getattr(text_config, "max_position_embeddings", None)
+
     if max_len is None:
         raise ValueError("max_position_embeddings not found in HFModelConfig!")
     return int(max_len)
@@ -83,13 +94,6 @@ async def ensure_async_iterator(iterable):
 def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
     """Deduplicate consecutive image tokens in prompt_ids for Qwen2.5-VL, since vLLM will replicate the
     <|image_pad|> and <|video_pad|> token by image_data.
-
-    This helper is only for local prompt reconstruction paths (e.g. rebuilding
-    HF processor inputs for position-id / multimodal feature computation).
-    It must not be applied to the raw prompt sent into vLLM together with
-    ``multi_modal_data``, because vLLM's own multimodal prompt updater expects
-    the original processor-produced placeholder layout.
-
     For example,
     ```
     <|vision_start|><|image_pad|><|image_pad|>...<|image_pad|><|vision_end|>

@@ -729,6 +729,29 @@ def compute_reinforce_plus_plus_outcome_advantage(
     return advantages, returns
 
 
+@register_adv_est("reinforce")
+def compute_reinforce_compat_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible alias for local launchers that still use ``reinforce``.
+
+    The PPO trainer's main advantage-estimator registry exposes
+    ``reinforce_plus_plus`` rather than a standalone ``reinforce`` estimator.
+    Some local experiment scripts still pass ``algorithm.adv_estimator=reinforce``;
+    map that legacy name onto the existing critic-free estimator so those
+    launchers continue to run.
+    """
+    return compute_reinforce_plus_plus_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        config=config,
+        **kwargs,
+    )
+
+
 @register_adv_est(AdvantageEstimator.REMAX)  # or simply: @register_adv_est("remax")
 def compute_remax_outcome_advantage(
     token_level_rewards: torch.Tensor,

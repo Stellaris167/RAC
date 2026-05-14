@@ -44,12 +44,20 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing
-from verl.utils.model import normalize_model_name, get_text_config
+from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import HFModelConfig, McoreEngineConfig
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_text_model_config(hf_config):
+    for attr_name in ("text_config", "llm_config", "language_config"):
+        sub_config = getattr(hf_config, attr_name, None)
+        if sub_config is not None:
+            return sub_config
+    return None
 
 
 def get_model_config(model):
@@ -180,18 +188,16 @@ def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
     # For transformers <= 4.57.6
     if hasattr(hf_config, "rope_theta"):
         return hf_config.rope_theta
-
-    # Check text-specific sub-configs (handles InternVL and Qwen variants)
-    text_cfg = get_text_config(hf_config)
-    if hasattr(text_cfg, "rope_theta"):
-        return text_cfg.rope_theta
+    text_config = _get_text_model_config(hf_config)
+    if text_config is not None and hasattr(text_config, "rope_theta"):
+        return text_config.rope_theta
 
     # For transformers >= 5.0.0, check rope_parameters dict (optionally nested) for rope_theta
     rp = None
     if hasattr(hf_config, "rope_parameters"):
         rp = hf_config.rope_parameters
-    elif hasattr(text_cfg, "rope_parameters"):
-        rp = text_cfg.rope_parameters
+    elif text_config is not None and hasattr(text_config, "rope_parameters"):
+        rp = text_config.rope_parameters
     if isinstance(rp, dict):
         if "rope_theta" in rp:
             return rp["rope_theta"]
@@ -240,10 +246,8 @@ def make_megatron_module(
         else:
             from verl.models.mcore.bridge import freeze_moe_router, make_value_model
 
-            from verl.utils.model import get_text_config
-
-            text_cfg = get_text_config(hf_config)
-            hidden_size = getattr(text_cfg, "hidden_size", hf_config.hidden_size)
+            text_config = _get_text_model_config(hf_config)
+            hidden_size = text_config.hidden_size if text_config is not None else hf_config.hidden_size
             value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
 
         post_model_creation_callbacks = []
@@ -961,12 +965,6 @@ def default_tp_concat_fn(
     """
     from megatron.core import mpu
 
-    def _get_vision_num_heads(config):
-        vision_cfg = getattr(config, "vision_config", None)
-        if vision_cfg is None:
-            return None
-        return getattr(vision_cfg, "num_heads", getattr(vision_cfg, "num_attention_heads", None))
-
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
         # if the tensor is qkv, for each param on tp, split into q, k, v
@@ -977,13 +975,8 @@ def default_tp_concat_fn(
         num_attention_heads = model_config.num_attention_heads
         num_key_value_heads = model_config.num_key_value_heads
         if "vision_model" in name:
-            vision_num_heads = _get_vision_num_heads(hf_config)
-            if vision_num_heads is None:
-                raise AttributeError(
-                    f"vision_config of {type(hf_config).__name__} has neither num_heads nor num_attention_heads"
-                )
-            num_attention_heads = vision_num_heads
-            num_key_value_heads = vision_num_heads
+            num_attention_heads = hf_config.vision_config.num_heads
+            num_key_value_heads = hf_config.vision_config.num_heads
         assert num_attention_heads % num_key_value_heads == 0
         num_q_per_kv = num_attention_heads // num_key_value_heads
         assert infer_params[0].shape[0] % (num_q_per_kv + 2) == 0, (

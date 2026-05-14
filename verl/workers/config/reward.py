@@ -47,14 +47,9 @@ class RewardManagerConfig(BaseConfig):
     source: str = "register"
     name: str = "naive"
     module: Optional[ModuleConfig] = field(default_factory=ModuleConfig)
-    dump_pairs: bool = False
-    dump_dir: Optional[str] = None
-    dump_max_samples_per_worker: int = 2000
 
     def __post_init__(self):
         super().__post_init__()
-        if self.dump_max_samples_per_worker < 0:
-            raise ValueError("dump_max_samples_per_worker must be non-negative")
         if self.source == "register":
             from verl.experimental.reward_loop.reward_manager.registry import REWARD_MANAGER
 

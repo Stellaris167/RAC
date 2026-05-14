@@ -37,6 +37,23 @@ _PREFIX_GROUPER_PATCHED = False
 _PREFIX_GROUPER_SUPPORTED_ATTENTIONS = {"flash_attention_2", "flash_attention_3", "sdpa", "flex_attention", "eager"}
 
 
+def _resolve_attention_config(config):
+    if hasattr(config, "num_attention_heads") and hasattr(config, "num_key_value_heads"):
+        return config
+
+    for attr_name in ("text_config", "llm_config", "language_config"):
+        sub_config = getattr(config, attr_name, None)
+        if sub_config is None:
+            continue
+        if hasattr(sub_config, "num_attention_heads") and hasattr(sub_config, "num_key_value_heads"):
+            return sub_config
+
+    raise AttributeError(
+        f"{type(config).__name__} does not expose num_attention_heads/num_key_value_heads on "
+        "the top-level config or known text sub-configs"
+    )
+
+
 def _create_prefix_grouper_wrapper(original_fn):
     """Wrap attention function to support prefix_grouper in kwargs."""
 
@@ -82,6 +99,46 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
     return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
+
+
+def _should_patch_internvl_vision_encoder(vision_encoder) -> bool:
+    if vision_encoder is None:
+        return False
+
+    module_name = getattr(vision_encoder.__class__, "__module__", "")
+    if module_name.startswith("vllm."):
+        return False
+
+    return hasattr(vision_encoder, "gradient_checkpointing") or hasattr(
+        vision_encoder, "_gradient_checkpointing_func"
+    )
+
+
+def _patch_internvl_forward(model) -> bool:
+    from verl.models.transformers.internvl import internvl_chat_forward, internvl_vision_encoder_forward
+
+    patched = False
+    pending = [model]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+
+        if getattr(getattr(current, "config", None), "model_type", None) in {"internvl_chat", "internvl"}:
+            current.__class__.forward = internvl_chat_forward
+            vision_encoder = getattr(getattr(current, "vision_model", None), "encoder", None)
+            if _should_patch_internvl_vision_encoder(vision_encoder):
+                vision_encoder.__class__.forward = internvl_vision_encoder_forward
+            patched = True
+
+        for attr in ("model", "module", "base_model", "language_model", "pretrained_model", "vision_model"):
+            pending.append(getattr(current, attr, None))
+
+    if patched:
+        print(f"Monkey patch {model.__class__.__name__} model forward")
+    return patched
 
 
 def _ulysses_flash_attention_forward(
@@ -272,11 +329,6 @@ def patch_forward_with_backends(
 
         forward_with_torch_backend_function = forward_with_torch_backend
         forward_with_triton_backend_function = forward_with_triton_backend
-    elif model.config.model_type in ["internvl_chat", "internvl"]:
-        # InternVL has dedicated multimodal forward logic and is not adapted to
-        # dense_common fused PPO backends yet.
-        print(f"Skip fused-kernel forward patch for {model.__class__.__name__} (InternVL)")
-        return
     else:
         from verl.models.transformers.dense_common import forward_with_torch_backend, forward_with_triton_backend
 
@@ -332,30 +384,9 @@ def apply_monkey_patch(
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]
 
-    try:
-        from verl.utils.model import get_text_config
-
-        text_cfg = get_text_config(model.config)
-    except Exception:
-        text_cfg = getattr(model.config, "text_config", model.config)
-
-    # `text_cfg` now obtained via helper or fallback; continue with resolving heads
-    num_attention_heads = getattr(model.config, "num_attention_heads", None)
-    num_key_value_heads = getattr(model.config, "num_key_value_heads", None)
-    if num_attention_heads is None:
-        num_attention_heads = getattr(text_cfg, "num_attention_heads", None)
-    if num_key_value_heads is None:
-        num_key_value_heads = getattr(text_cfg, "num_key_value_heads", None)
-
-    if num_attention_heads is None or num_key_value_heads is None:
-        print(
-            f"[MonkeyPatch] Warning: missing attention head attributes for model_type={getattr(model.config, 'model_type', None)}; "
-            "skipping strict head-based checks."
-        )
-        # set safe defaults to avoid integer asserts later; these defaults will
-        # effectively disable Ulysses-specific checks when not applicable.
-        num_attention_heads = int(num_attention_heads or 1)
-        num_key_value_heads = int(num_key_value_heads or 1)
+    attention_config = _resolve_attention_config(model.config)
+    num_attention_heads = attention_config.num_attention_heads
+    num_key_value_heads = attention_config.num_key_value_heads
 
     assert num_attention_heads % ulysses_sp_size == 0, (
         f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
@@ -398,11 +429,7 @@ def apply_monkey_patch(
             Qwen2_5_VLModel = SimpleNamespace(forward=None)
             Qwen2VLModel = SimpleNamespace(forward=None)
 
-        from verl.models.transformers.qwen2_vl import (
-            forward_with_normal_backend,
-            is_flash_attn_ready,
-            qwen2_vl_base_forward,
-        )
+        from verl.models.transformers.qwen2_vl import forward_with_normal_backend, qwen2_vl_base_forward
 
         Qwen2_5_VLModel.forward = qwen2_vl_base_forward
         Qwen2VLModel.forward = qwen2_vl_base_forward
@@ -422,17 +449,12 @@ def apply_monkey_patch(
             )
             from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLFlashAttention2 as Qwen2VLAttention
 
-        if (use_remove_padding or ulysses_sp_size > 1) and is_flash_attn_ready():
+        if use_remove_padding or ulysses_sp_size > 1:
             from verl.models.transformers.qwen2_vl import qwen2_vl_attn_forward
 
             Qwen2_5_VLAttention.forward = qwen2_vl_attn_forward
             Qwen2VLAttention.forward = qwen2_vl_attn_forward
             print(f"Monkey patch {model.__class__.__name__} attention layer")
-        elif use_remove_padding or ulysses_sp_size > 1:
-            print(
-                f"Skip attention monkey patch for {model.__class__.__name__}: flash_attn unavailable, "
-                "fallback to HF attention implementation."
-            )
 
         # Step 3: patch input for multimodal sequence parallelism
         if ulysses_sp_size > 1:
@@ -500,12 +522,6 @@ def apply_monkey_patch(
         if ulysses_sp_size > 1:
             patch_vlm_for_ulysses_input_slicing(Glm4vTextModel)
 
-    elif model.config.model_type in ["internvl_chat", "internvl"]:
-        from verl.models.transformers.internvl import internvl_chat_forward
-
-        model.__class__.forward = internvl_chat_forward
-        print(f"Monkey patch {model.__class__.__name__} model forward for InternVL")
-
     elif model.config.model_type == "kimi_vl":
         if use_remove_padding or ulysses_sp_size > 1:
             # TODO: Changes need to be made when transformers are adapted.
@@ -549,6 +565,8 @@ def apply_monkey_patch(
         # Step 2: patch vision model to fix fsdp2 cpu_offload bug.
         Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
         Qwen3_5MoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+    elif model.config.model_type in ["internvl_chat", "internvl"]:
+        _patch_internvl_forward(model)
 
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models

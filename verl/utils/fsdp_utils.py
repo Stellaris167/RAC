@@ -15,7 +15,6 @@
 import functools
 import itertools
 import json
-import logging
 import math
 import os
 from abc import ABC
@@ -35,8 +34,6 @@ from transformers.trainer_pt_utils import get_module_class_from_name
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.model import check_exclude_modules, check_target_modules
-
-logger = logging.getLogger(__name__)
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, fully_shard
@@ -109,39 +106,6 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
 
-    def _normalize_cls_names(cls_names):
-        if cls_names is None:
-            return []
-        if isinstance(cls_names, str):
-            return [cls_names]
-        if isinstance(cls_names, set):
-            return list(cls_names)
-        return [x for x in cls_names if x]
-
-    def _infer_transformer_cls_names(root_module):
-        # Heuristic: select frequently repeated block classes that look like transformer layers.
-        counts = {}
-        for _, sub_module in root_module.named_modules():
-            if sub_module is root_module:
-                continue
-            if sum(1 for _ in sub_module.parameters(recurse=True)) == 0:
-                continue
-            if not any(
-                hasattr(sub_module, attr)
-                for attr in ("self_attn", "attention", "attn", "mlp", "feed_forward", "ffn")
-            ):
-                continue
-            cls_name = sub_module.__class__.__name__
-            counts[cls_name] = counts.get(cls_name, 0) + 1
-
-        # Prefer classes that repeat (typical decoder blocks), fallback to best single candidate.
-        repeated = [name for name, cnt in counts.items() if cnt > 1]
-        if repeated:
-            return repeated
-        if counts:
-            return [max(counts.items(), key=lambda x: x[1])[0]]
-        return []
-
     # Add lambda policy for LoRA modules if is_lora is True
     if is_lora:
 
@@ -159,74 +123,24 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
-        cls_name_candidates = _normalize_cls_names(fsdp_transformer_layer_cls_to_wrap)
         transformer_cls_to_wrap = set()
-        missing_layer_classes = []
-        for layer_class in cls_name_candidates:
+        for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                missing_layer_classes.append(layer_class)
+                raise Exception("Could not find the transformer layer class to wrap in the model.")
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        # Fallback for custom VLMs (e.g. InternVL wrappers) where configured class names do not
-        # exist at the root model level.
-        if not transformer_cls_to_wrap:
-            inferred_names = _infer_transformer_cls_names(module)
-            for layer_class in inferred_names:
-                transformer_cls = get_module_class_from_name(module, layer_class)
-                if transformer_cls is not None:
-                    transformer_cls_to_wrap.add(transformer_cls)
-            if inferred_names:
-                logger.warning(
-                    "FSDP wrap policy fallback: configured classes not found (%s); inferred classes=%s",
-                    missing_layer_classes,
-                    inferred_names,
-                )
-
-        if transformer_cls_to_wrap:
-            transformer_policy = functools.partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls=transformer_cls_to_wrap,
-            )
-            policies.append(transformer_policy)
-        else:
-            # Final safety net: avoid hard crash and still produce an actionable policy.
-            # Use a conservative size-based policy if no layer class can be resolved.
-            fallback_min_num_params = max(min_num_params, int(1e8))
-            logger.warning(
-                "FSDP wrap policy: no transformer classes resolved from %s; falling back to size-based policy "
-                "with min_num_params=%d",
-                cls_name_candidates,
-                fallback_min_num_params,
-            )
-            size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=fallback_min_num_params)
-            policies.append(size_policy)
+        transformer_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_cls_to_wrap,
+        )
+        policies.append(transformer_policy)
 
     if len(policies) > 0:
         auto_wrap_policy = functools.partial(_or_policy, policies=policies)
 
     return auto_wrap_policy
-
-
-@torch.no_grad()
-def reshard_fsdp_model(model):
-    """Reshard an FSDP model back to local shards when supported.
-
-    This is required before manual CPU offload, otherwise some torch/FSDP
-    states may leave ``flat_param.data`` pointing at an unsharded/full-param
-    buffer that does not match ``_local_shard``.
-    """
-    version_id = fsdp_version(model)
-    if version_id == 1:
-        assert isinstance(model, FSDP)
-        _lazy_init(model, model)
-        if model._is_root and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            handle = getattr(model, "_handle", None)
-            if handle is not None:
-                handle.reshard(True)
-    elif version_id == 2 and hasattr(model, "reshard"):
-        model.reshard()
 
 
 @torch.no_grad()
@@ -239,20 +153,31 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
     # lazy init FSDP model
     _lazy_init(model, model)
     assert model._is_root, "Only support root model offloading to CPU"
-    reshard_fsdp_model(model)
     for handle in model._all_handles:
         if handle._offload_params:
             continue
         flat_param = handle.flat_param
         local_shard = getattr(flat_param, "_local_shard", None)
-        if local_shard is None or flat_param.data.size() != local_shard.size():
+        if local_shard is None:
             flat_param._local_shard = flat_param.data
-        elif flat_param.data.data_ptr() != local_shard.data_ptr():
-            # Some torch versions leave ``data`` and ``_local_shard`` as
-            # different views after forward/unshard transitions. Refresh the
-            # active shard reference before the manual device move.
-            flat_param._local_shard = flat_param.data
-        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+            local_shard = flat_param._local_shard
+        elif (
+            flat_param.data.data_ptr() != local_shard.data_ptr() or flat_param.data.size() != local_shard.size()
+        ):
+            if getattr(handle, "uses_sharded_strategy", False):
+                # Some FSDP states keep flat_param.data on the unsharded/full buffer until reshard.
+                # Restore the sharded view before offloading so _local_shard remains the canonical shard.
+                handle.reshard(True)
+                local_shard = flat_param._local_shard
+            else:
+                flat_param._local_shard = flat_param.data
+                local_shard = flat_param._local_shard
+
+        assert flat_param.data.data_ptr() == local_shard.data_ptr() and flat_param.data.size() == local_shard.size()
+        # Keep CPU offload synchronous to match upstream FSDP. The manual reshard/offload
+        # path here may leave pending device work on the shard buffer, and async D2H copies
+        # can surface as illegal access later at empty_cache().
+        handle.flat_param_to(torch.device("cpu"), non_blocking=False)
         flat_param._local_shard = flat_param.data
     if empty_cache:
         get_torch_device().empty_cache()
@@ -633,32 +558,9 @@ def apply_fsdp2(model, fsdp_kwargs, config):
 
     if isinstance(fsdp_transformer_layer_cls_to_wrap, set):
         fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
-
-    if not fsdp_transformer_layer_cls_to_wrap or fsdp_transformer_layer_cls_to_wrap[0] is None:
-        inferred = []
-        for _, sub_module in model.named_modules():
-            if sub_module is model:
-                continue
-            if sum(1 for _ in sub_module.parameters(recurse=True)) == 0:
-                continue
-            if any(
-                hasattr(sub_module, attr)
-                for attr in ("self_attn", "attention", "attn", "mlp", "feed_forward", "ffn")
-            ):
-                inferred.append(sub_module.__class__.__name__)
-        fsdp_transformer_layer_cls_to_wrap = sorted(set(inferred))
-        logger.warning(
-            "FSDP2 wrap policy fallback: transformer_layer_cls_to_wrap unset/empty, inferred=%s",
-            fsdp_transformer_layer_cls_to_wrap,
-        )
+    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
     modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
-
-    if len(modules) == 0:
-        logger.warning(
-            "FSDP2 wrap policy: no per-layer wrap targets matched from classes=%s; wrapping root model only.",
-            fsdp_transformer_layer_cls_to_wrap,
-        )
 
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

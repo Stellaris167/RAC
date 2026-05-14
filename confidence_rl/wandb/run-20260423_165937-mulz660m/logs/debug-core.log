@@ -1,8 +1,0 @@
-{"time":"2026-04-23T16:59:37.644416327+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpttihzq36/port-349397.txt","pid":349397,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
-{"time":"2026-04-23T16:59:37.645334547+08:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":349397}
-{"time":"2026-04-23T16:59:37.645311016+08:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/wandb-349397-363110-3699185677/socket","Net":"unix"}}
-{"time":"2026-04-23T16:59:37.676561107+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
-{"time":"2026-04-23T16:59:37.684735237+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"mulz660m","id":"1(@)"}
-{"time":"2026-04-23T16:59:39.713320861+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"mulz660m","id":"1(@)"}
-{"time":"2026-04-23T16:59:49.090050451+08:00","level":"INFO","msg":"connection: cancelling request","id":"1(@)","requestId":"b5qe0w3ayrso"}
-{"time":"2026-04-23T17:16:50.97271525+08:00","level":"INFO","msg":"server: parent process exited, terminating service process"}

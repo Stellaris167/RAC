@@ -18,15 +18,6 @@ import torch
 from transformers import PretrainedConfig
 
 from verl.utils.device import get_torch_device
-from verl.utils.model import get_text_config
-
-
-def _get_vision_attr(config, *names, default=None):
-    for name in names:
-        value = getattr(config, name, None)
-        if value is not None:
-            return value
-    return default
 
 _DEVICE_FLOPS = {
     "CPU": 448e9,
@@ -131,13 +122,12 @@ def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
     # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
-    text_cfg = get_text_config(config)
-    hidden_size = text_cfg.hidden_size
-    vocab_size = text_cfg.vocab_size
-    num_hidden_layers = text_cfg.num_hidden_layers
-    num_key_value_heads = text_cfg.num_key_value_heads
-    num_attention_heads = text_cfg.num_attention_heads
-    intermediate_size = text_cfg.intermediate_size
+    hidden_size = config.text_config.hidden_size
+    vocab_size = config.text_config.vocab_size
+    num_hidden_layers = config.text_config.num_hidden_layers
+    num_key_value_heads = config.text_config.num_key_value_heads
+    num_attention_heads = config.text_config.num_attention_heads
+    intermediate_size = config.text_config.intermediate_size
 
     head_dim = hidden_size // num_attention_heads
     q_size = num_attention_heads * head_dim
@@ -164,10 +154,7 @@ def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **ka
     # vit flops
     images_seqlens = kargs.get("images_seqlens", None)
     if images_seqlens is not None:
-        if getattr(config, "model_type", None) in ["internvl_chat", "internvl"]:
-            vit_flops = _estimate_internvl_vit_flop(images_seqlens, config.vision_config)
-        else:
-            vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
     else:
         vit_flops = 0
 
@@ -179,17 +166,18 @@ def _estimate_qwen3_vl_flops(config, tokens_sum, batch_seqlens, delta_time, **ka
 
 def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
     # qwen3_vl uses text_config and vision_config to distinguish configs of different parts.
-    text_cfg = get_text_config(config)
-    hidden_size = text_cfg.hidden_size
-    vocab_size = text_cfg.vocab_size
-    num_hidden_layers = text_cfg.num_hidden_layers
-    num_key_value_heads = text_cfg.num_key_value_heads
-    num_attention_heads = text_cfg.num_attention_heads
-    moe_intermediate_size = getattr(text_cfg, "moe_intermediate_size", None)
-    moe_num_expert = getattr(text_cfg, "num_experts", None)
-    moe_topk = getattr(text_cfg, "num_experts_per_tok", None)
+    hidden_size = config.text_config.hidden_size
+    vocab_size = config.text_config.vocab_size
+    num_hidden_layers = config.text_config.num_hidden_layers
+    num_key_value_heads = config.text_config.num_key_value_heads
+    num_attention_heads = config.text_config.num_attention_heads
+    moe_intermediate_size = config.text_config.moe_intermediate_size
+    moe_num_expert = config.text_config.num_experts
+    moe_topk = config.text_config.num_experts_per_tok
 
-    head_dim = getattr(text_cfg, "head_dim", text_cfg.hidden_size // text_cfg.num_attention_heads)
+    head_dim = getattr(
+        config.text_config, "head_dim", config.text_config.hidden_size // config.text_config.num_attention_heads
+    )
     q_size = num_attention_heads * head_dim
     k_size = num_key_value_heads * head_dim
     v_size = num_key_value_heads * head_dim
@@ -214,10 +202,7 @@ def _estimate_qwen3_vl_moe_flops(config, tokens_sum, batch_seqlens, delta_time, 
     # vit flops
     images_seqlens = kargs.get("images_seqlens", None)
     if images_seqlens is not None:
-        if getattr(config, "model_type", None) in ["internvl_chat", "internvl"]:
-            vit_flops = _estimate_internvl_vit_flop(images_seqlens, config.vision_config)
-        else:
-            vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
+        vit_flops = _estimate_qwen3_vit_flop(images_seqlens, config.vision_config)
     else:
         vit_flops = 0
 
@@ -236,21 +221,19 @@ def _estimate_qwen3_vit_flop(images_seqlens, config):
         return 0
     tokens_sum = sum(images_seqlens)
 
-    num_heads = _get_vision_attr(config, "num_heads", "num_attention_heads")
-    depth = _get_vision_attr(config, "depth", "num_hidden_layers")
+    num_heads = config.num_heads
+    depth = config.depth
 
     dim = config.hidden_size
     mlp_hidden_dim = config.intermediate_size
-    out_hidden_size = _get_vision_attr(config, "out_hidden_size", default=dim)
+    out_hidden_size = config.out_hidden_size
 
-    spatial_merge_size = _get_vision_attr(config, "spatial_merge_size", default=1)
+    spatial_merge_size = config.spatial_merge_size
 
     head_dim = dim // num_heads
 
     # every vision token's patch_embed comes from a conv of (C, T, H, W) -> (dim,)
-    in_channels = _get_vision_attr(config, "in_channels", "num_channels", default=3)
-    temporal_patch_size = _get_vision_attr(config, "temporal_patch_size", default=1)
-    patch_embed_N = dim * in_channels * temporal_patch_size * config.patch_size * config.patch_size
+    patch_embed_N = dim * config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size
     # Qwen3 VL vision mlp does not use GLU, thus 2.
     mlp_N = dim * mlp_hidden_dim * 2
     attn_linear_N = dim * (4 * dim)  # qkv and output proj
@@ -279,41 +262,6 @@ def _estimate_qwen3_vit_flop(images_seqlens, config):
     vit_flops = dense_N_flops + attn_qkv_flops
 
     return vit_flops
-
-
-def _estimate_internvl_vit_flop(images_seqlens, config):
-    """Estimate FLOPS of InternVL vision encoder.
-
-    InternVL uses InternVisionConfig, whose field names differ from Qwen3-VL
-    (`num_attention_heads` / `num_hidden_layers` instead of `num_heads` / `depth`).
-    It also lacks Qwen3-specific merger/deepstack fields, so this estimator keeps
-    the ViT term to patch embedding + transformer blocks.
-    """
-    if config is None:
-        return 0
-
-    tokens_sum = sum(images_seqlens)
-    num_heads = _get_vision_attr(config, "num_attention_heads", "num_heads")
-    depth = _get_vision_attr(config, "num_hidden_layers", "depth")
-    dim = config.hidden_size
-    mlp_hidden_dim = config.intermediate_size
-    in_channels = _get_vision_attr(config, "num_channels", "in_channels", default=3)
-    temporal_patch_size = _get_vision_attr(config, "temporal_patch_size", default=1)
-
-    head_dim = dim // num_heads
-
-    patch_embed_N = dim * in_channels * temporal_patch_size * config.patch_size * config.patch_size
-    mlp_N = dim * mlp_hidden_dim * 2
-    attn_linear_N = dim * (4 * dim)
-    dense_N = patch_embed_N + (mlp_N + attn_linear_N) * depth
-    dense_N_flops = 6 * dense_N * tokens_sum
-
-    seqlen_square_sum = 0
-    for seqlen in images_seqlens:
-        seqlen_square_sum += seqlen * seqlen
-    attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * depth
-
-    return dense_N_flops + attn_qkv_flops
 
 
 def _estimate_deepseek_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
@@ -590,6 +538,35 @@ def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
     return 0
 
 
+_TEXT_BACKBONE_ESTIMATE_FUNC = {
+    "qwen2": _estimate_qwen2_flops,
+    "llama": _estimate_qwen2_flops,
+    "qwen2_moe": _estimate_qwen2_moe_flops,
+    "qwen3": _estimate_qwen2_flops,
+    "qwen3_moe": _estimate_qwen2_moe_flops,
+    "deepseek_v3": _estimate_deepseek_v3_flops,
+    "minicpmv": _estimate_qwen2_flops,
+    "minicpmo": _estimate_qwen2_flops,
+    "mistral": _estimate_qwen2_flops,
+    "gemma3_text": _estimate_gemma3_flops,
+    "seed_oss": _estimate_qwen2_flops,
+    "apertus": _estimate_apertus_flops,
+    "glm4v": _estimate_qwen2_flops,
+    "gpt_oss": _estimate_gpt_oss_flops,
+    "mimo": _estimate_qwen2_flops,
+}
+
+
+def _estimate_text_backbone_flops(config, tokens_sum, batch_seqlens, delta_time):
+    text_config = getattr(config, "text_config", None) or getattr(config, "llm_config", None)
+    if text_config is None:
+        return 0
+
+    text_model_type = getattr(text_config, "model_type", None)
+    func = _TEXT_BACKBONE_ESTIMATE_FUNC.get(text_model_type, _estimate_unknown_flops)
+    return func(text_config, tokens_sum, batch_seqlens, delta_time)
+
+
 ESTIMATE_FUNC = {
     "qwen2": _estimate_qwen2_flops,
     "llama": _estimate_qwen2_flops,
@@ -610,9 +587,8 @@ ESTIMATE_FUNC = {
     "glm4v": _estimate_qwen2_flops,
     "gpt_oss": _estimate_gpt_oss_flops,
     "mimo": _estimate_qwen2_flops,
-    # InternVL-style configs (internvl_chat) are handled like other VL models
-    "internvl_chat": _estimate_qwen3_vl_flops,
-    "internvl": _estimate_qwen3_vl_flops,
+    "internvl": _estimate_text_backbone_flops,
+    "internvl_chat": _estimate_text_backbone_flops,
 }
 
 

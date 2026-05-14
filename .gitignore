@@ -1,16 +1,28 @@
-**/datasets
-**/examples/confidence_rl/wandb
-**/examples/confidence_rl/outputs
-
 **/*.pt
 **/checkpoints
 **/wget-log
 **/_build/
 **/*.ckpt
 **/outputs
+**/outputs/
 **/*.tar.gz
 **/playground
 **/wandb
+**/wandb/
+**/logs
+**/logs/
+**/log
+**/log/
+**/.hydra
+**/.hydra/
+**/val_dumps
+**/val_dumps/
+**/latest-run
+**/debug.log
+**/debug-internal.log
+
+# Local release-prep archive
+bak/
 
 /pyrightconfig.json
 
@@ -63,6 +75,9 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 pytest.ini
 output.txt
 
@@ -127,7 +142,10 @@ ENV/
 
 # data
 *.parquet
+*.tex
 
+# debug
+tests/
 
 # local logs
 logs

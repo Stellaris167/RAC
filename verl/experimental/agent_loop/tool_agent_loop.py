@@ -209,9 +209,6 @@ class ToolAgentLoop(AgentLoopBase):
             videos=agent_data.video_data,
         )
         agent_data.prompt_ids = prompt_ids
-        agent_data.image_data, agent_data.video_data = self._align_multi_modal_data(
-            prompt_ids, agent_data.image_data, agent_data.video_data
-        )
         return AgentState.GENERATING
 
     async def _handle_generating_state(
@@ -219,11 +216,17 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> AgentState:
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
+        prompt_text = self._build_server_prompt_text(
+            agent_data.prompt_ids,
+            images=agent_data.image_data,
+            videos=agent_data.video_data,
+        )
 
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
+                prompt_text=prompt_text,
                 sampling_params=sampling_params,
                 image_data=agent_data.image_data,
                 video_data=agent_data.video_data,
@@ -245,7 +248,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
-        agent_data.prompt_ids += agent_data.response_ids
+        served_prompt_ids = self._resolve_output_prompt_ids(agent_data.prompt_ids, output)
+        agent_data.prompt_ids = served_prompt_ids + agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs

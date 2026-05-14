@@ -53,20 +53,6 @@ from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
-
-def _sanitize_max_new_tokens(requested_tokens: Any, max_possible_tokens: int, source: str) -> int:
-    max_new_tokens = int(requested_tokens)
-    max_new_tokens = min(max_new_tokens, max_possible_tokens)
-    if max_new_tokens >= 1:
-        return max_new_tokens
-    if max_possible_tokens >= 1:
-        logger.warning("Adjusted %s from %s to 1 to satisfy generation constraints.", source, requested_tokens)
-        return 1
-    raise ValueError(
-        f"No room left for generation: {source}={requested_tokens}, max_possible_tokens={max_possible_tokens}. "
-        "Prompt consumed the full context window; truncate the prompt or increase max_model_len."
-    )
-
 visible_devices_keyword = get_visible_devices_keyword()
 
 
@@ -412,17 +398,12 @@ class SGLangHttpServer:
                 self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
             )
 
-        max_new_tokens = _sanitize_max_new_tokens(max_new_tokens, max_possible_tokens, source="max_new_tokens")
+        # Clamp max_new_tokens to the valid range [0, max_possible_tokens]
+        max_new_tokens = max(0, min(max_new_tokens, max_possible_tokens))
 
         assert max_new_tokens <= max_possible_tokens, (
             f"max_new_tokens {max_new_tokens} exceeds available context space {max_possible_tokens}"
         )
-        if "min_new_tokens" in sampling_params:
-            sampling_params["min_new_tokens"] = _sanitize_max_new_tokens(
-                sampling_params["min_new_tokens"],
-                max_new_tokens,
-                source="min_new_tokens",
-            )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 

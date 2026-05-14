@@ -22,7 +22,7 @@ from verl.base_config import BaseConfig
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import get_generation_config, update_model_config, get_text_config
+from verl.utils.model import get_generation_config, update_model_config
 
 __all__ = ["HFModelConfig", "DiffusionModelConfig", "MtpConfig"]
 
@@ -162,9 +162,6 @@ class HFModelConfig(BaseConfig):
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
             self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
 
-        if self.processor is not None and getattr(self.processor, "tokenizer", None) is not None:
-            self.tokenizer = self.processor.tokenizer
-
         # For base models (e.g. Qwen3.5-2b-Base), the processor may not have a chat_template
         # while the tokenizer does. Sync it so that processor.apply_chat_template() works.
         if (
@@ -219,8 +216,7 @@ class HFModelConfig(BaseConfig):
 
         # per model patch
         if getattr(self.hf_config, "model_type", None) == "kimi_vl":
-            text_cfg = get_text_config(self.hf_config)
-            setattr(text_cfg, "topk_method", "greedy")
+            self.hf_config.text_config.topk_method = "greedy"
 
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:

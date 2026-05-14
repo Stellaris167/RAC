@@ -15,7 +15,6 @@ import inspect
 import logging
 import os
 import socket
-import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -36,9 +35,6 @@ __all__ = ["Worker"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-_RESOURCE_CHECK_INTERVAL_SECONDS = float(os.getenv("VERL_RESOURCE_CHECK_INTERVAL_SECONDS", "5"))
-_RESOURCE_CHECK_TIMEOUT_SECONDS = float(os.getenv("VERL_RESOURCE_CHECK_TIMEOUT_SECONDS", "300"))
 
 
 def get_random_string(length: int) -> str:
@@ -222,48 +218,21 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
+        node_available_resources = ray._private.state.available_resources_per_node()
+        node_available_gpus = {
+            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
+            for node, node_info in node_available_resources.items()
+        }
+
+        # check total required gpus can be satisfied
+        total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
-        deadline = time.monotonic() + _RESOURCE_CHECK_TIMEOUT_SECONDS
-        last_registered_gpus = 0.0
-        last_available_gpus = 0.0
-        last_alive_nodes: list[str] = []
-
-        while True:
-            alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
-            node_registered_gpus = {
-                node["NodeManagerAddress"]: node.get("Resources", {}).get("GPU", node.get("Resources", {}).get("NPU", 0))
-                for node in alive_nodes
-            }
-            node_available_resources = ray._private.state.available_resources_per_node()
-            node_available_gpus = {
-                node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-                for node, node_info in node_available_resources.items()
-            }
-
-            last_registered_gpus = float(sum(node_registered_gpus.values()))
-            last_available_gpus = float(sum(node_available_gpus.values()))
-            last_alive_nodes = sorted(node_registered_gpus)
-
-            if last_registered_gpus >= total_required_gpus:
-                return
-
-            if time.monotonic() >= deadline:
-                raise ValueError(
-                    "Total registered GPUs "
-                    f"{last_registered_gpus} is less than total desired GPUs {total_required_gpus}; "
-                    f"currently available GPUs {last_available_gpus}; alive nodes={last_alive_nodes}"
-                )
-
-            logger.warning(
-                "Waiting for Ray cluster resources: registered_gpus=%s available_gpus=%s required_gpus=%s alive_nodes=%s",
-                last_registered_gpus,
-                last_available_gpus,
-                total_required_gpus,
-                last_alive_nodes,
+        if total_available_gpus < total_required_gpus:
+            raise ValueError(
+                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
-            time.sleep(_RESOURCE_CHECK_INTERVAL_SECONDS)
 
 
 def extract_pg_from_exist(

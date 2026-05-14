@@ -10,6 +10,7 @@ Kept 8 corruption types safe for math/science images:
 Severity: 1 (mild) to 5 (severe), mapped to T labels:
   severity 1 = T0.2, severity 2 = T0.4, ..., severity 5 = T1.0
 """
+
 from __future__ import annotations
 
 import warnings
@@ -23,7 +24,7 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 warnings.simplefilter("ignore", UserWarning)
 
 SEVERITY_TO_T = {1: "T0.2", 2: "T0.4", 3: "T0.6", 4: "T0.8", 5: "T1.0"}
-T_TO_SEVERITY = {v: k for k, v in SEVERITY_TO_T.items()}
+T_TO_SEVERITY = {value: key for key, value in SEVERITY_TO_T.items()}
 
 CORRUPTION_NAMES = [
     "gaussian_noise",
@@ -37,147 +38,154 @@ CORRUPTION_NAMES = [
 ]
 
 
-def _next_power_of_2(n):
-    p = 1
-    while p < n:
-        p = p * 2
-    return p
+def _ensure_rng(rng: np.random.Generator | None) -> np.random.Generator:
+    return rng if rng is not None else np.random.default_rng()
 
 
-def plasma_fractal(mapsize=256, wibbledecay=3.0):
+def _next_power_of_2(n: int) -> int:
+    power = 1
+    while power < n:
+        power *= 2
+    return power
+
+
+def plasma_fractal(mapsize: int = 256, wibbledecay: float = 3.0, rng: np.random.Generator | None = None):
     """Diamond-square heightmap, returns (mapsize, mapsize) in [0,1]."""
     assert (mapsize & (mapsize - 1)) == 0
-    m = np.empty((mapsize, mapsize), dtype=np.float64)
-    m[0, 0] = 0
+    rng = _ensure_rng(rng)
+    heightmap = np.empty((mapsize, mapsize), dtype=np.float64)
+    heightmap[0, 0] = 0
     step = mapsize
-    wib = 100.0
+    wibble = 100.0
 
-    def wm(a):
-        return a / 4 + wib * np.random.uniform(-wib, wib, a.shape)
+    def wibbled_mean(area):
+        return area / 4 + wibble * rng.uniform(-wibble, wibble, area.shape)
 
-    def fill_sq():
-        cr = m[0:mapsize:step, 0:mapsize:step]
-        sa = cr + np.roll(cr, shift=-1, axis=0)
-        sa += np.roll(sa, shift=-1, axis=1)
-        m[step // 2:mapsize:step, step // 2:mapsize:step] = wm(sa)
+    def fill_squares():
+        corner_refs = heightmap[0:mapsize:step, 0:mapsize:step]
+        square_acc = corner_refs + np.roll(corner_refs, shift=-1, axis=0)
+        square_acc += np.roll(square_acc, shift=-1, axis=1)
+        heightmap[step // 2:mapsize:step, step // 2:mapsize:step] = wibbled_mean(square_acc)
 
-    def fill_dm():
-        dr = m[step // 2:mapsize:step, step // 2:mapsize:step]
-        ul = m[0:mapsize:step, 0:mapsize:step]
-        ld = dr + np.roll(dr, 1, axis=0)
-        lu = ul + np.roll(ul, -1, axis=1)
-        lt = ld + lu
-        m[0:mapsize:step, step // 2:mapsize:step] = wm(lt)
-        td = dr + np.roll(dr, 1, axis=1)
-        tu = ul + np.roll(ul, -1, axis=0)
-        tt = td + tu
-        m[step // 2:mapsize:step, 0:mapsize:step] = wm(tt)
+    def fill_diamonds():
+        diamond_refs = heightmap[step // 2:mapsize:step, step // 2:mapsize:step]
+        upper_left = heightmap[0:mapsize:step, 0:mapsize:step]
+        left_down = diamond_refs + np.roll(diamond_refs, 1, axis=0)
+        left_up = upper_left + np.roll(upper_left, -1, axis=1)
+        left_total = left_down + left_up
+        heightmap[0:mapsize:step, step // 2:mapsize:step] = wibbled_mean(left_total)
+        top_down = diamond_refs + np.roll(diamond_refs, 1, axis=1)
+        top_up = upper_left + np.roll(upper_left, -1, axis=0)
+        top_total = top_down + top_up
+        heightmap[step // 2:mapsize:step, 0:mapsize:step] = wibbled_mean(top_total)
 
     while step >= 2:
-        fill_sq()
-        fill_dm()
+        fill_squares()
+        fill_diamonds()
         step //= 2
-        wib /= wibbledecay
+        wibble /= wibbledecay
 
-    m -= m.min()
-    mx = m.max()
-    if mx > 0:
-        m /= mx
-    return m
+    heightmap -= heightmap.min()
+    max_value = heightmap.max()
+    if max_value > 0:
+        heightmap /= max_value
+    return heightmap
 
 
-# ---- corruption functions (PIL in, PIL out) ----
-
-def gaussian_noise(x, severity=1):
-    c = [0.08, 0.12, 0.18, 0.26, 0.38][severity - 1]
-    a = np.array(x) / 255.0
-    out = np.clip(a + np.random.normal(size=a.shape, scale=c), 0, 1) * 255
+def gaussian_noise(x, severity: int = 1, rng: np.random.Generator | None = None):
+    rng = _ensure_rng(rng)
+    scale = [0.08, 0.12, 0.18, 0.26, 0.38][severity - 1]
+    array = np.array(x) / 255.0
+    out = np.clip(array + rng.normal(size=array.shape, scale=scale), 0, 1) * 255
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def shot_noise(x, severity=1):
-    c = [60, 25, 12, 5, 3][severity - 1]
-    a = np.array(x) / 255.0
-    out = np.clip(np.random.poisson(a * c) / float(c), 0, 1) * 255
+def shot_noise(x, severity: int = 1, rng: np.random.Generator | None = None):
+    rng = _ensure_rng(rng)
+    scale = [60, 25, 12, 5, 3][severity - 1]
+    array = np.array(x) / 255.0
+    out = np.clip(rng.poisson(array * scale) / float(scale), 0, 1) * 255
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def impulse_noise(x, severity=1):
-    c = [0.03, 0.06, 0.09, 0.17, 0.27][severity - 1]
-    a = np.array(x).copy()
-    h, w, ch = a.shape
-    n_pixels = int(h * w * c)
-    # salt
-    ys = np.random.randint(0, h, n_pixels)
-    xs = np.random.randint(0, w, n_pixels)
-    salt = np.random.random(n_pixels) > 0.5
-    a[ys[salt], xs[salt]] = 255
-    a[ys[~salt], xs[~salt]] = 0
-    return PILImage.fromarray(a)
+def impulse_noise(x, severity: int = 1, rng: np.random.Generator | None = None):
+    rng = _ensure_rng(rng)
+    scale = [0.03, 0.06, 0.09, 0.17, 0.27][severity - 1]
+    array = np.array(x).copy()
+    height, width, _ = array.shape
+    n_pixels = int(height * width * scale)
+    ys = rng.integers(0, height, n_pixels)
+    xs = rng.integers(0, width, n_pixels)
+    salt = rng.random(n_pixels) > 0.5
+    array[ys[salt], xs[salt]] = 255
+    array[ys[~salt], xs[~salt]] = 0
+    return PILImage.fromarray(array)
 
 
-def fog(x, severity=1):
-    c = [(1.5, 2), (2.0, 2), (2.5, 1.7), (2.5, 1.5), (3.0, 1.4)][severity - 1]
-    a = np.array(x) / 255.0
-    h, w = a.shape[:2]
-    ms = max(_next_power_of_2(max(h, w)), 4)
-    fl = plasma_fractal(mapsize=ms, wibbledecay=c[1])[:h, :w]
-    a = a + c[0] * fl[..., np.newaxis]
-    mx = a.max()
-    out = np.clip(a * mx / (mx + c[0]), 0, 1) * 255
+def fog(x, severity: int = 1, rng: np.random.Generator | None = None):
+    rng = _ensure_rng(rng)
+    scale = [(1.5, 2), (2.0, 2), (2.5, 1.7), (2.5, 1.5), (3.0, 1.4)][severity - 1]
+    array = np.array(x) / 255.0
+    height, width = array.shape[:2]
+    mapsize = max(_next_power_of_2(max(height, width)), 4)
+    fractal = plasma_fractal(mapsize=mapsize, wibbledecay=scale[1], rng=rng)[:height, :width]
+    array = array + scale[0] * fractal[..., np.newaxis]
+    max_value = array.max()
+    out = np.clip(array * max_value / (max_value + scale[0]), 0, 1) * 255
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def brightness(x, severity=1):
-    c = [0.1, 0.2, 0.3, 0.4, 0.5][severity - 1]
-    a = np.array(x).astype(np.float32)
-    hsv = cv2.cvtColor(a, cv2.COLOR_RGB2HSV)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] + c * 255, 0, 255)
+def brightness(x, severity: int = 1, rng: np.random.Generator | None = None):
+    del rng
+    scale = [0.1, 0.2, 0.3, 0.4, 0.5][severity - 1]
+    array = np.array(x).astype(np.float32)
+    hsv = cv2.cvtColor(array, cv2.COLOR_RGB2HSV)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] + scale * 255, 0, 255)
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return PILImage.fromarray(rgb.astype(np.uint8))
 
 
-def contrast(x, severity=1):
-    c = [0.4, 0.3, 0.2, 0.1, 0.05][severity - 1]
-    a = np.array(x) / 255.0
-    means = np.mean(a, axis=(0, 1), keepdims=True)
-    out = np.clip((a - means) * c + means, 0, 1) * 255
+def contrast(x, severity: int = 1, rng: np.random.Generator | None = None):
+    del rng
+    scale = [0.4, 0.3, 0.2, 0.1, 0.05][severity - 1]
+    array = np.array(x) / 255.0
+    means = np.mean(array, axis=(0, 1), keepdims=True)
+    out = np.clip((array - means) * scale + means, 0, 1) * 255
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def elastic_transform(x, severity=1):
-    REF = 244.0
-    img = np.array(x, dtype=np.float32) / 255.0
-    shape = img.shape
-    ss = shape[:2]
-    s = min(ss) / REF
-    c_raw = [
-        (REF * 2, REF * 0.7, REF * 0.1),
-        (REF * 2, REF * 0.08, REF * 0.2),
-        (REF * 0.05, REF * 0.01, REF * 0.02),
-        (REF * 0.07, REF * 0.01, REF * 0.02),
-        (REF * 0.12, REF * 0.01, REF * 0.02),
+def elastic_transform(x, severity: int = 1, rng: np.random.Generator | None = None):
+    rng = _ensure_rng(rng)
+    ref_size = 244.0
+    image = np.array(x, dtype=np.float32) / 255.0
+    shape = image.shape
+    spatial_shape = shape[:2]
+    scale = min(spatial_shape) / ref_size
+    raw_config = [
+        (ref_size * 2, ref_size * 0.7, ref_size * 0.1),
+        (ref_size * 2, ref_size * 0.08, ref_size * 0.2),
+        (ref_size * 0.05, ref_size * 0.01, ref_size * 0.02),
+        (ref_size * 0.07, ref_size * 0.01, ref_size * 0.02),
+        (ref_size * 0.12, ref_size * 0.01, ref_size * 0.02),
     ][severity - 1]
-    c = (c_raw[0] * s, c_raw[1] * s, c_raw[2] * s)
+    config = (raw_config[0] * scale, raw_config[1] * scale, raw_config[2] * scale)
 
-    csq = np.float32(ss) // 2
-    sqsz = min(ss) // 3
-    pts1 = np.float32([
-        csq + sqsz,
-        [csq[0] + sqsz, csq[1] - sqsz],
-        csq - sqsz,
+    center = np.float32(spatial_shape) // 2
+    square_size = min(spatial_shape) // 3
+    points_1 = np.float32([
+        center + square_size,
+        [center[0] + square_size, center[1] - square_size],
+        center - square_size,
     ])
-    pts2 = pts1 + np.random.uniform(-c[2], c[2], size=pts1.shape).astype(np.float32)
-    M = cv2.getAffineTransform(pts1, pts2)
-    img = cv2.warpAffine(img, M, ss[::-1], borderMode=cv2.BORDER_REFLECT_101)
+    points_2 = points_1 + rng.uniform(-config[2], config[2], size=points_1.shape).astype(np.float32)
+    affine = cv2.getAffineTransform(points_1, points_2)
+    image = cv2.warpAffine(image, affine, spatial_shape[::-1], borderMode=cv2.BORDER_REFLECT_101)
 
-    sigma_val = max(c[1], 0.01)
-    dx = (gaussian_filter(np.random.uniform(-1, 1, size=shape[:2]),
-                          sigma_val, mode="reflect", truncate=3) * c[0]).astype(np.float32)
-    dy = (gaussian_filter(np.random.uniform(-1, 1, size=shape[:2]),
-                          sigma_val, mode="reflect", truncate=3) * c[0]).astype(np.float32)
-    dx = dx[..., np.newaxis]
-    dy = dy[..., np.newaxis]
+    sigma = max(config[1], 0.01)
+    dx = gaussian_filter(rng.uniform(-1, 1, size=shape[:2]), sigma, mode="reflect", truncate=3) * config[0]
+    dy = gaussian_filter(rng.uniform(-1, 1, size=shape[:2]), sigma, mode="reflect", truncate=3) * config[0]
+    dx = dx.astype(np.float32)[..., np.newaxis]
+    dy = dy.astype(np.float32)[..., np.newaxis]
 
     yy, xx, zz = np.meshgrid(
         np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing="ij"
@@ -187,18 +195,17 @@ def elastic_transform(x, severity=1):
         np.reshape(xx + dx, (-1, 1)),
         np.reshape(zz, (-1, 1)),
     )
-    out = np.clip(
-        map_coordinates(img, indices, order=1, mode="reflect").reshape(shape), 0, 1
-    ) * 255
+    out = np.clip(map_coordinates(image, indices, order=1, mode="reflect").reshape(shape), 0, 1) * 255
     return PILImage.fromarray(out.astype(np.uint8))
 
 
-def jpeg_compression(x, severity=1):
-    c = [25, 18, 15, 10, 7][severity - 1]
-    buf = BytesIO()
-    x.save(buf, "JPEG", quality=c)
-    buf.seek(0)
-    return PILImage.open(buf).convert("RGB")
+def jpeg_compression(x, severity: int = 1, rng: np.random.Generator | None = None):
+    del rng
+    quality = [25, 18, 15, 10, 7][severity - 1]
+    buffer = BytesIO()
+    x.save(buffer, "JPEG", quality=quality)
+    buffer.seek(0)
+    return PILImage.open(buffer).convert("RGB")
 
 
 CORRUPTION_FUNCTIONS = {
@@ -213,19 +220,18 @@ CORRUPTION_FUNCTIONS = {
 }
 
 
-def apply_corruption(image, corruption_name, severity=1):
+def apply_corruption(image, corruption_name: str, severity: int = 1, rng: np.random.Generator | None = None):
     """Apply a named corruption at given severity to a PIL image."""
     if corruption_name not in CORRUPTION_FUNCTIONS:
         raise ValueError(f"Unknown corruption: {corruption_name}")
     if severity < 1 or severity > 5:
         raise ValueError(f"Severity must be 1-5, got {severity}")
     image = image.convert("RGB")
-    return CORRUPTION_FUNCTIONS[corruption_name](image, severity)
+    return CORRUPTION_FUNCTIONS[corruption_name](image, severity, rng=rng)
 
 
-def apply_random_corruption(image, severity=1, rng=None):
+def apply_random_corruption(image, severity: int = 1, rng: np.random.Generator | None = None):
     """Apply a randomly chosen corruption. Returns (image, name)."""
-    if rng is None:
-        rng = np.random.default_rng()
+    rng = _ensure_rng(rng)
     name = rng.choice(CORRUPTION_NAMES)
-    return apply_corruption(image, name, severity), name
+    return apply_corruption(image, name, severity, rng=rng), name

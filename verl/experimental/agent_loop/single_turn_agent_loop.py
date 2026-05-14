@@ -54,6 +54,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             videos=videos,
         )
         images, videos = self._align_multi_modal_data(prompt_ids, images, videos)
+        prompt_text = self._build_server_prompt_text(prompt_ids, images=images, videos=videos)
         multi_modal_data = {}
         if images is not None:
             multi_modal_data["images"] = images
@@ -66,6 +67,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=uuid4().hex,
                 prompt_ids=prompt_ids,
+                prompt_text=prompt_text,
                 sampling_params=sampling_params,
                 image_data=images,
                 video_data=videos,
@@ -73,6 +75,13 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)
+        prompt_ids = self._resolve_output_prompt_ids(prompt_ids, output)
+        images, videos = self._align_multi_modal_data(prompt_ids, images, videos)
+        multi_modal_data = {}
+        if images is not None:
+            multi_modal_data["images"] = images
+        if videos is not None:
+            multi_modal_data["videos"] = videos
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -170,12 +179,6 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
 
         # 2. apply chat template and tokenize
         prompt_ids = await self.apply_chat_template(raw_prompt, images=images, videos=videos)
-        images, videos = self._align_multi_modal_data(prompt_ids, images, videos)
-        multi_modal_data = {}
-        if images is not None:
-            multi_modal_data["images"] = images
-        if videos is not None:
-            multi_modal_data["videos"] = videos
 
         if raw_negative_prompt is not None:
             negative_prompt_ids = await self.apply_chat_template(raw_negative_prompt, images=images, videos=videos)

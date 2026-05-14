@@ -39,6 +39,7 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.internvl_processor import build_internvl_vllm_prompt_text
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
@@ -53,7 +54,6 @@ from verl.workers.config import (
     HFModelConfig,
     RolloutConfig,
 )
-from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
 from verl.workers.rollout.replica import DiffusionOutput, TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
@@ -62,116 +62,220 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
-def _get_processor_rope_index_fn(processor):
-    processor_name = processor.__class__.__name__
-    match processor_name:
-        case "Qwen2VLProcessor" | "Qwen2_5_VLProcessor":
-            from verl.models.transformers.qwen2_vl import get_rope_index
+def _count_visual_runs(prompt_ids: list[int], token_id: Optional[int]) -> int:
+    if token_id is None or token_id < 0:
+        return 0
 
-            return get_rope_index
-        case "Qwen3VLProcessor":
-            from verl.models.transformers.qwen3_vl import get_rope_index
-
-            return get_rope_index
-        case "Glm4vImageProcessor":
-            from verl.models.transformers.glm4v import get_rope_index
-
-            return get_rope_index
-        case _:
-            return None
+    count = 0
+    in_run = False
+    for prompt_id in prompt_ids:
+        if prompt_id == token_id:
+            if not in_run:
+                count += 1
+                in_run = True
+        else:
+            in_run = False
+    return count
 
 
-def _normalize_multi_modal_prompt_inputs(processor, prompt_ids, images, videos, video_metadatas):
-    normalized_prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, processor)
+def _resolve_vision_start_token_id(processor) -> Optional[int]:
+    vision_start_token_id = getattr(processor, "vision_start_token_id", None)
+    if vision_start_token_id is not None:
+        return vision_start_token_id
 
-    image_token_id = getattr(processor, "image_token_id", None)
-    video_token_id = getattr(processor, "video_token_id", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return None
 
-    image_count = normalized_prompt_ids.count(image_token_id) if images is not None and image_token_id is not None else 0
-    video_count = normalized_prompt_ids.count(video_token_id) if videos is not None and video_token_id is not None else 0
-
-    if images is not None:
-        images = list(images)[-image_count:] if image_count > 0 else None
-
-    if videos is not None:
-        videos = list(videos)[-video_count:] if video_count > 0 else None
-        if video_metadatas is not None:
-            video_metadatas = list(video_metadatas)[-video_count:] if video_count > 0 else None
-    else:
-        video_metadatas = None
-
-    return normalized_prompt_ids, images, videos, video_metadatas
+    try:
+        token_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    except Exception:
+        return None
+    return token_id if token_id is not None and token_id >= 0 else None
 
 
 def _count_retained_multi_modal_items(processor, prompt_ids: list[int]) -> tuple[int, int]:
-    if processor is None:
+    if processor is None or not prompt_ids:
         return 0, 0
 
     image_token_id = getattr(processor, "image_token_id", None)
     video_token_id = getattr(processor, "video_token_id", None)
-    vision_start_token_id = getattr(processor, "vision_start_token_id", None)
-    if vision_start_token_id is None and hasattr(processor, "tokenizer"):
-        try:
-            vision_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        except Exception:
-            vision_start_token_id = None
+    vision_start_token_id = _resolve_vision_start_token_id(processor)
 
-    if vision_start_token_id is not None:
+    if vision_start_token_id is not None and vision_start_token_id in prompt_ids:
         image_count = 0
         video_count = 0
-        for idx, token_id in enumerate(prompt_ids[:-1]):
-            if token_id != vision_start_token_id:
+        for index, prompt_id in enumerate(prompt_ids[:-1]):
+            if prompt_id != vision_start_token_id:
                 continue
-            next_token_id = prompt_ids[idx + 1]
-            if image_token_id is not None and next_token_id == image_token_id:
+            next_prompt_id = prompt_ids[index + 1]
+            if image_token_id is not None and next_prompt_id == image_token_id:
                 image_count += 1
-            elif video_token_id is not None and next_token_id == video_token_id:
+            elif video_token_id is not None and next_prompt_id == video_token_id:
                 video_count += 1
         return image_count, video_count
 
-    image_count = prompt_ids.count(image_token_id) if image_token_id is not None else 0
-    video_count = prompt_ids.count(video_token_id) if video_token_id is not None else 0
-    return image_count, video_count
+    return _count_visual_runs(prompt_ids, image_token_id), _count_visual_runs(prompt_ids, video_token_id)
 
 
 def _align_multi_modal_data_to_prompt(processor, prompt_ids: list[int], images, videos):
     image_count, video_count = _count_retained_multi_modal_items(processor, prompt_ids)
 
-    aligned_images = None if images is None else (list(images)[-image_count:] if image_count > 0 else None)
-    aligned_videos = None if videos is None else (list(videos)[-video_count:] if video_count > 0 else None)
-    return aligned_images, aligned_videos
+    retained_images = None
+    if images is not None and image_count > 0:
+        retained_images = list(images)[-image_count:]
+
+    retained_videos = None
+    if videos is not None and video_count > 0:
+        retained_videos = list(videos)[-video_count:]
+
+    return retained_images, retained_videos
+
+
+def _normalize_multi_modal_prompt_inputs(processor, prompt_ids: list[int], images, videos, video_metadatas):
+    image_token_id = getattr(processor, "image_token_id", None)
+    video_token_id = getattr(processor, "video_token_id", None)
+
+    normalized_prompt_ids: list[int] = []
+    previous_prompt_id = None
+    for prompt_id in prompt_ids:
+        if prompt_id == previous_prompt_id and prompt_id in {image_token_id, video_token_id}:
+            continue
+        normalized_prompt_ids.append(prompt_id)
+        previous_prompt_id = prompt_id
+
+    retained_images, retained_videos = _align_multi_modal_data_to_prompt(processor, normalized_prompt_ids, images, videos)
+    retained_video_metadatas = None
+    if retained_videos is not None and video_metadatas is not None:
+        retained_video_metadatas = list(video_metadatas)[-len(retained_videos):]
+
+    return normalized_prompt_ids, retained_images, retained_videos, retained_video_metadatas
+
+
+def _maybe_build_multimodal_prompt_text(processor, tokenizer, prompt_ids: list[int], images, videos) -> Optional[str]:
+    if processor is None:
+        return None
+    if not images and not videos:
+        return None
+
+    model_type = getattr(getattr(processor, "config", None), "model_type", None)
+    if model_type not in {"internvl_chat", "internvl"}:
+        return None
+
+    return build_internvl_vllm_prompt_text(tokenizer, prompt_ids)
+
+
+def _resolve_served_prompt_token_ids(prompt_ids: list[int], output) -> list[int]:
+    served_prompt_token_ids = getattr(output, "prompt_token_ids", None)
+    if served_prompt_token_ids is None:
+        return list(prompt_ids)
+    return normalize_token_ids(served_prompt_token_ids)
 
 
 def _safe_left_truncate_visual_token_runs(processor, token_ids: list[int], max_length: int) -> list[int]:
-    """Left-truncate token ids without splitting visual pad-token runs.
-
-    Qwen2.x-VL style processors expand a single image/video placeholder into a
-    contiguous run of repeated visual pad tokens. If a left truncation lands in
-    the middle of that run, downstream reconstructed multimodal inputs and rope
-    position computation become inconsistent. In that case we advance the cut
-    point past the remainder of the run so it is removed atomically.
-    """
+    if max_length <= 0:
+        return []
     if len(token_ids) <= max_length:
         return token_ids
 
-    cut = len(token_ids) - max_length
+    truncated = list(token_ids[-max_length:])
+    visual_token_ids = set(getattr(processor, "visual_token_ids", set()) or set())
+    if not visual_token_ids:
+        for token_id in (getattr(processor, "image_token_id", None), getattr(processor, "video_token_id", None)):
+            if token_id is not None and token_id >= 0:
+                visual_token_ids.add(token_id)
+    while truncated and truncated[0] in visual_token_ids:
+        truncated.pop(0)
+    return truncated
 
-    if processor is not None:
-        image_tid = getattr(processor, "image_token_id", None)
-        video_tid = getattr(processor, "video_token_id", None)
-        visual_ids: set[int] = set()
-        if image_tid is not None:
-            visual_ids.add(image_tid)
-        if video_tid is not None:
-            visual_ids.add(video_tid)
-        extra_visual_ids = getattr(processor, "visual_token_ids", None)
-        if extra_visual_ids is not None:
-            visual_ids.update(int(token_id) for token_id in extra_visual_ids)
-        if visual_ids:
-            while cut < len(token_ids) and token_ids[cut] in visual_ids:
-                cut += 1
 
-    return token_ids[cut:]
+def _truncate_agent_loop_output_to_rollout_lengths(
+    processor,
+    output: "AgentLoopOutput",
+    prompt_length: Optional[int],
+    response_length: Optional[int],
+) -> "AgentLoopOutput":
+    original_prompt_ids = list(output.prompt_ids)
+    original_response_ids = list(output.response_ids)
+    changed = False
+
+    prompt_ids = list(original_prompt_ids)
+    response_ids = list(original_response_ids)
+    response_mask = list(output.response_mask)
+    response_logprobs = list(output.response_logprobs) if output.response_logprobs is not None else None
+    multi_modal_data = dict(output.multi_modal_data) if output.multi_modal_data is not None else None
+    routed_experts = output.routed_experts
+
+    if prompt_length is not None and len(prompt_ids) > prompt_length:
+        changed = True
+        prompt_ids = (
+            _safe_left_truncate_visual_token_runs(processor, prompt_ids, int(prompt_length))
+            if processor is not None
+            else prompt_ids[-int(prompt_length) :]
+        )
+        logger.warning(
+            "Left-truncated agent-loop prompt from %d to %d tokens to match rollout prompt_length=%s.",
+            len(original_prompt_ids),
+            len(prompt_ids),
+            prompt_length,
+        )
+        if multi_modal_data is not None:
+            images, videos = _align_multi_modal_data_to_prompt(
+                processor,
+                prompt_ids,
+                multi_modal_data.get("images"),
+                multi_modal_data.get("videos"),
+            )
+            multi_modal_data["images"] = images
+            multi_modal_data["videos"] = videos
+
+    response_limit = int(response_length) if response_length is not None else None
+    if response_limit is not None and len(response_ids) > response_limit:
+        changed = True
+        response_ids = response_ids[:response_limit]
+        logger.warning(
+            "Right-truncated agent-loop response from %d to %d tokens to match rollout response_length=%s.",
+            len(original_response_ids),
+            len(response_ids),
+            response_length,
+        )
+
+    if response_limit is not None and len(response_mask) > response_limit:
+        changed = True
+        response_mask = response_mask[:response_limit]
+    else:
+        changed = changed or len(response_mask) > len(response_ids)
+        response_mask = response_mask[: len(response_ids)]
+
+    if response_logprobs is not None:
+        if response_limit is not None and len(response_logprobs) > response_limit:
+            changed = True
+            response_logprobs = response_logprobs[:response_limit]
+        else:
+            changed = changed or len(response_logprobs) > len(response_ids)
+            response_logprobs = response_logprobs[: len(response_ids)]
+
+    prompt_trim = len(original_prompt_ids) - len(prompt_ids)
+    total_kept_length = len(prompt_ids) + len(response_ids)
+    if routed_experts is not None and (prompt_trim > 0 or total_kept_length < len(original_prompt_ids) + len(original_response_ids)):
+        changed = True
+        keep_start = prompt_trim
+        keep_end = keep_start + total_kept_length
+        routed_experts = routed_experts[keep_start:keep_end]
+
+    if not changed:
+        return output
+
+    return output.model_copy(
+        update={
+            "prompt_ids": prompt_ids,
+            "response_ids": response_ids,
+            "response_mask": response_mask,
+            "response_logprobs": response_logprobs,
+            "multi_modal_data": multi_modal_data,
+            "routed_experts": routed_experts,
+        }
+    )
 
 
 @ray.remote
@@ -259,6 +363,7 @@ class AsyncLLMServerManager:
         *,
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
+        prompt_text: Optional[str] = None,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         **kwargs: Any,
@@ -279,6 +384,7 @@ class AsyncLLMServerManager:
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
+                prompt_text=prompt_text,
                 image_data=image_data,
                 video_data=video_data,
                 **kwargs,
@@ -422,12 +528,15 @@ class AgentLoopBase(ABC):
         configured_budget = None
         prompt_length = getattr(self.rollout_config, "prompt_length", None)
         response_length = getattr(self.rollout_config, "response_length", None)
-        if prompt_length is not None and response_length is not None:
-            configured_budget = prompt_length + response_length - 1
+        if prompt_length is not None:
+            configured_budget = int(prompt_length)
 
         max_model_len = getattr(self.rollout_config, "max_model_len", None)
         if max_model_len is not None:
-            model_budget = max_model_len - 1
+            if response_length is not None:
+                model_budget = max_model_len - int(response_length)
+            else:
+                model_budget = max_model_len - 1
             configured_budget = model_budget if configured_budget is None else min(configured_budget, model_budget)
 
         if configured_budget is None:
@@ -439,6 +548,12 @@ class AgentLoopBase(ABC):
 
     def _align_multi_modal_data(self, prompt_ids: list[int], images, videos):
         return _align_multi_modal_data_to_prompt(self.processor, prompt_ids, images, videos)
+
+    def _build_server_prompt_text(self, prompt_ids: list[int], images=None, videos=None) -> Optional[str]:
+        return _maybe_build_multimodal_prompt_text(self.processor, self.tokenizer, prompt_ids, images, videos)
+
+    def _resolve_output_prompt_ids(self, prompt_ids: list[int], output) -> list[int]:
+        return _resolve_served_prompt_token_ids(prompt_ids, output)
 
     def _truncate_prompt_ids_to_budget(self, prompt_ids: list[int], source: str) -> list[int]:
         prompt_budget = self._get_prompt_token_budget()
@@ -499,17 +614,7 @@ class AgentLoopBase(ABC):
             list[int]: Prompt token ids.
         """
         if self.processor is not None:
-            raw_prompt = await self.loop.run_in_executor(
-                None,
-                lambda: apply_chat_template(
-                    self.processor,
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    **self.apply_chat_template_kwargs,
-                ),
-            )
+            raw_prompt = await self.render_chat_template(messages, tools=tools)
 
             # split the videos and according metadatas
             if videos is not None:
@@ -548,6 +653,24 @@ class AgentLoopBase(ABC):
             prompt_ids = self._truncate_prompt_ids_to_budget(prompt_ids, source="system-prompt-trimmed")
 
         return prompt_ids
+
+    async def render_chat_template(
+        self,
+        messages: list[dict],
+        tools: list[dict] = None,
+    ) -> str:
+        processing_class = self.processor if self.processor is not None else self.tokenizer
+        return await self.loop.run_in_executor(
+            None,
+            lambda: apply_chat_template(
+                processing_class,
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.apply_chat_template_kwargs,
+            ),
+        )
 
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -702,7 +825,7 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
-            repetition_penalty=config.get("repetition_penalty", 1.0),
+            repetition_penalty=config.repetition_penalty,
             logprobs=config.calculate_log_probs,
         )
 
@@ -795,6 +918,12 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        output = _truncate_agent_loop_output_to_rollout_lengths(
+            self.processor,
+            output,
+            prompt_length=getattr(self.rollout_config, "prompt_length", None),
+            response_length=getattr(self.rollout_config, "response_length", None),
+        )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -817,66 +946,9 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
-        prompt_ids = list(output.prompt_ids)
-        response_ids = list(output.response_ids)
-        response_mask_list = list(output.response_mask)
-        response_logprobs_list = list(output.response_logprobs) if output.response_logprobs is not None else None
-        routed_experts_source = output.routed_experts
-        aligned_multi_modal_data = dict(output.multi_modal_data or {})
-
-        if len(prompt_ids) > self.rollout_config.prompt_length:
-            original_len = len(prompt_ids)
-            prompt_ids = _safe_left_truncate_visual_token_runs(
-                self.processor, prompt_ids, self.rollout_config.prompt_length
-            )
-            logger.warning(
-                "Postprocess truncated prompt_ids from %d to %d tokens before batching.",
-                original_len,
-                len(prompt_ids),
-            )
-
-        if aligned_multi_modal_data:
-            aligned_images, aligned_videos = _align_multi_modal_data_to_prompt(
-                self.processor,
-                prompt_ids,
-                aligned_multi_modal_data.get("images"),
-                aligned_multi_modal_data.get("videos"),
-            )
-            if aligned_images is None:
-                aligned_multi_modal_data.pop("images", None)
-            else:
-                aligned_multi_modal_data["images"] = aligned_images
-            if aligned_videos is None:
-                aligned_multi_modal_data.pop("videos", None)
-            else:
-                aligned_multi_modal_data["videos"] = aligned_videos
-        else:
-            aligned_multi_modal_data = None
-
-        if len(response_ids) > self.rollout_config.response_length:
-            logger.warning(
-                "Postprocess truncated response_ids from %d to %d tokens before batching.",
-                len(response_ids),
-                self.rollout_config.response_length,
-            )
-            response_ids = response_ids[: self.rollout_config.response_length]
-
-        response_mask_list = response_mask_list[: len(response_ids)]
-        if len(response_mask_list) < len(response_ids):
-            response_mask_list.extend([1] * (len(response_ids) - len(response_mask_list)))
-
-        if response_logprobs_list is not None:
-            response_logprobs_list = response_logprobs_list[: len(response_ids)]
-            if len(response_logprobs_list) < len(response_ids):
-                response_logprobs_list.extend([0.0] * (len(response_ids) - len(response_logprobs_list)))
-
-        if routed_experts_source is not None:
-            target_total_length = len(prompt_ids) + len(response_ids)
-            routed_experts_source = routed_experts_source[-target_total_length:]
-
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": prompt_ids},
+            {"input_ids": output.prompt_ids},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
             return_tensors="pt",
@@ -888,7 +960,7 @@ class AgentLoopWorker:
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": response_ids},
+            {"input_ids": output.response_ids},
             padding="max_length",
             max_length=self.rollout_config.response_length,
             return_tensors="pt",
@@ -899,7 +971,7 @@ class AgentLoopWorker:
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": response_mask_list},
+            {"input_ids": output.response_mask},
             padding="max_length",
             max_length=self.rollout_config.response_length,
             return_tensors="pt",
@@ -909,31 +981,31 @@ class AgentLoopWorker:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
-        if response_logprobs_list is not None:
-            pad_size = self.rollout_config.response_length - len(response_logprobs_list)
-            response_logprobs = torch.tensor(response_logprobs_list + [0.0] * pad_size).unsqueeze(0)
+        if output.response_logprobs is not None:
+            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
         routed_experts = None
-        if routed_experts_source is not None:
+        if output.routed_experts is not None:
             total_length = input_ids.shape[1]
-            length, layer_num, topk_num = routed_experts_source.shape
-            if isinstance(routed_experts_source, np.ndarray):
-                routed_experts_array = routed_experts_source
+            length, layer_num, topk_num = output.routed_experts.shape
+            if isinstance(output.routed_experts, np.ndarray):
+                routed_experts_array = output.routed_experts
                 if not routed_experts_array.flags.writeable:
                     routed_experts_array = routed_experts_array.copy()
                 experts_tensor = torch.from_numpy(routed_experts_array)
-            elif isinstance(routed_experts_source, torch.Tensor):
-                experts_tensor = routed_experts_source
+            elif isinstance(output.routed_experts, torch.Tensor):
+                experts_tensor = output.routed_experts
             else:
-                raise TypeError(f"Unsupported type for routed_experts: {type(routed_experts_source)}")
+                raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
             # Add boundary checks for robustness
@@ -944,8 +1016,7 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        output.multi_modal_data = aligned_multi_modal_data
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids, attention_mask)
+        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
             output,
@@ -958,8 +1029,8 @@ class AgentLoopWorker:
         )
         await self._compute_teacher_logprobs(
             output,
-            prompt_ids=prompt_ids,
-            response_ids=response_ids,
+            prompt_ids=output.prompt_ids,
+            response_ids=output.response_ids,
             validate=validate,
         )
         teacher_ids, teacher_logprobs = (
@@ -975,8 +1046,8 @@ class AgentLoopWorker:
                 teacher_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
-                prompt_length=len(prompt_ids),
-                response_length=len(response_ids),
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
@@ -990,7 +1061,7 @@ class AgentLoopWorker:
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
-            multi_modal_data=aligned_multi_modal_data,
+            multi_modal_data=output.multi_modal_data,
             teacher_logprobs=teacher_logprobs,
             teacher_ids=teacher_ids,
             reward_score=output.reward_score,
@@ -999,26 +1070,21 @@ class AgentLoopWorker:
             extra_fields=output.extra_fields,
         )
 
-    def _compute_multi_modal_inputs(self, output, input_ids, attention_mask) -> dict[str, torch.Tensor]:
+    def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
         multi_modal_inputs = {}
         if self.processor is None:
             return multi_modal_inputs
 
-        multi_modal_data = output.multi_modal_data or {}
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+        images = output.multi_modal_data.get("images")
+        videos = output.multi_modal_data.get("videos")
         # split the videos and according metadatas
         if videos is not None:
             videos, video_metadatas = zip(*videos, strict=False)
             videos, video_metadatas = list(videos), list(video_metadatas)
         else:
             video_metadatas = None
-        valid_input_ids = input_ids.squeeze(0)[attention_mask.squeeze(0).bool()].tolist()
-        valid_input_ids, images, videos, video_metadatas = _normalize_multi_modal_prompt_inputs(
-            self.processor, valid_input_ids, images, videos, video_metadatas
-        )
-        current_text = self.tokenizer.decode(valid_input_ids, skip_special_tokens=False)
+        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
         multi_modal_inputs = self.processor(
             text=[current_text],
             images=images,
@@ -1030,11 +1096,9 @@ class AgentLoopWorker:
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
 
-        # Normalize both Hugging Face BatchFeature and custom dict-like processor outputs.
-        if hasattr(multi_modal_inputs, "convert_to_tensors"):
-            multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
-        else:
-            multi_modal_inputs = dict(multi_modal_inputs)
+        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+        # because np.array() only keeps the keys for BatchFeature.
+        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
@@ -1043,26 +1107,28 @@ class AgentLoopWorker:
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
+        get_rope_index = getattr(self.processor, "get_rope_index", None) if self.processor is not None else None
+        if not callable(get_rope_index):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
-
-        rope_index_fn = _get_processor_rope_index_fn(self.processor)
-        if rope_index_fn is None:
-            return compute_position_id_with_mask(attention_mask)
 
         multi_modal_kwargs = {
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
-            "second_per_grid_ts": multi_modal_inputs.get("second_per_grid_ts"),
         }
+        # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
+        if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
+            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
+            multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
-        vision_position_ids = rope_index_fn(
-            self.processor,
-            input_ids=input_ids.squeeze(0),
-            attention_mask=attention_mask.squeeze(0),
+        # Model's get_rope_index has been dynamically bind to the processor.
+        vision_position_ids, _ = get_rope_index(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             **multi_modal_kwargs,
         )
-        vision_position_ids = vision_position_ids.unsqueeze(0)  # (3, seq_len) => (1, 3, seq_len)
+        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
 
         valid_mask = attention_mask[0].bool()
         text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
@@ -1165,8 +1231,6 @@ class AgentLoopWorker:
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
-            if key in non_tensor_batch:
-                continue
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them

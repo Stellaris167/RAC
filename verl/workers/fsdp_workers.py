@@ -16,7 +16,6 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
-import gc
 import json
 import logging
 import os
@@ -81,8 +80,9 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.import_utils import import_external_libs
+from verl.utils.internvl_processor import bind_internvl_img_context_token_id
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import convert_weight_keys, get_text_config
+from verl.utils.model import convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -100,6 +100,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _bind_internvl_processor_state(model, tokenizer=None, processor=None):
+    if getattr(getattr(model, "config", None), "model_type", None) not in {"internvl_chat", "internvl"}:
+        return
+    bind_internvl_img_context_token_id(model, tokenizer=tokenizer, processor=processor)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -241,16 +247,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
 
         self._is_offload_param = False
-        self._is_ref_offload_param = False
         self._is_offload_optimizer = False
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
-        if self._is_ref:
+        elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
-            self._is_ref_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
-            if not self._is_actor:
-                self._is_offload_param = self._is_ref_offload_param
+            self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
 
         # normalize config
         if self._is_actor:
@@ -368,7 +371,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoModelForImageTextToText = AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
-        from verl.utils.tokenizer import bind_processor_tokens_to_model
         from verl.utils.torch_dtypes import PrecisionType
 
         AutoModelForVision2Seq = get_auto_model_for_vision2seq()
@@ -419,10 +421,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         ):
             actor_model_config.vision_config._attn_implementation = "flash_attention_2"
 
-        # patch for kimi-vl (safe accessor)
+        # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
-            text_cfg = get_text_config(actor_model_config)
-            setattr(text_cfg, "topk_method", "greedy")
+            actor_model_config.text_config.topk_method = "greedy"
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
@@ -483,7 +484,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=trust_remote_code,
                 attn_implementation=attn_implementation,
             )
-            bind_processor_tokens_to_model(actor_module, self.processor)
 
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
             if use_liger:
@@ -510,6 +510,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_tiled_mlp=use_tiled_mlp,
                 tiled_mlp_shards=tiled_mlp_shards,
             )
+            _bind_internvl_processor_state(actor_module, tokenizer=self.tokenizer, processor=self.processor)
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -547,8 +548,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
-
-            bind_processor_tokens_to_model(actor_module, self.processor)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -741,12 +740,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
-        self.torch_random_states = get_torch_device().get_rng_state()
-        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
-        get_torch_device().manual_seed(gen_dp_rank + 1000)
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
-
         # Full params
         if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
             FSDP.set_state_dict_type(
@@ -897,45 +890,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
         set_expandable_segments(True)
-
-    async def trainer_mode(self, skip_rollout_release: bool = False):
-        """Context switch hybridengine to trainer mode."""
-        rollout_engine_ready = getattr(self.rollout, "inference_engine", None) is not None
-        if self.config.rollout.free_cache_engine and not skip_rollout_release and rollout_engine_ready:
-            log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
-            log_gpu_memory_usage("After rollout offload", logger=logger)
-
-        self.actor_module_fsdp.train()
-
-        aggressive_empty_cache(force_sync=True)
-
-        set_expandable_segments(True)
-
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def prepare_for_rollout_launch(self):
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model before rollout launch", logger=logger)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer before rollout launch", logger=logger)
-        if self._is_ref and self._is_ref_offload_param:
-            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
-            log_gpu_memory_usage("After offload ref model before rollout launch", logger=logger)
-
-        await self.trainer_mode(skip_rollout_release=True)
-
-        set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(True)
-        return True
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1050,10 +1005,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     self.config.ref.use_prefix_grouper = use_prefix_grouper
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
 
-            if self._is_ref_offload_param:
-                offload_fsdp_model_to_cpu(self.ref_module_fsdp)
-                log_gpu_memory_usage("After offload ref model during init", logger=logger)
-
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(
@@ -1078,15 +1029,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=checkpoint_contents,
             )
 
-        # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo.
-        # Temporarily disable expandable_segments so the allocator releases
-        # entire reserved segments back to the CUDA driver.
-        set_expandable_segments(False)
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        set_expandable_segments(True)
-        log_gpu_memory_usage("After init_model cleanup", logger=logger)
+        # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
+        aggressive_empty_cache(force_sync=True)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -1247,9 +1191,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # else:
         # otherwise, the class have a standalone ref model
 
-        if self._is_ref_offload_param:
-            load_fsdp_model_to_gpu(self.ref_module_fsdp)
-
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["temperature"] = self.config.rollout.temperature
@@ -1270,10 +1211,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module._handle.reshard(True)
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
-
-        if self._is_ref_offload_param:
-            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
-            log_gpu_memory_usage("After offload ref model during compute_ref_log_prob", logger=logger)
 
         return output
 
@@ -1378,10 +1315,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             except Exception:
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        return self.rollout.get_zeromq_address()
 
 
 @deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
@@ -1517,10 +1450,9 @@ class CriticWorker(Worker, DistProfilerExtension):
             critic_model_config.vision_config._attn_implementation = "eager"
 
         critic_model_config.num_labels = 1
-        # patch for kimi-vl (safe accessor)
+        # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
-            text_cfg = get_text_config(critic_model_config)
-            setattr(text_cfg, "topk_method", "greedy")
+            critic_model_config.text_config.topk_method = "greedy"
 
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not critic_model_config.tie_word_embeddings, mesh=self.device_mesh
@@ -1557,6 +1489,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 use_tiled_mlp=use_tiled_mlp,
                 tiled_mlp_shards=tiled_mlp_shards,
             )
+            _bind_internvl_processor_state(critic_module, tokenizer=self.tokenizer, processor=self.processor)
 
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
@@ -1835,13 +1768,9 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.critic_optimizer)
 
+
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        await self.trainer_mode()
-        return True
-
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
         await self.rollout_mode()

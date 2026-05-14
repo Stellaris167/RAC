@@ -32,7 +32,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -598,12 +598,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
             )
 
-            self.torch_random_states = get_torch_device().get_rng_state()
-            gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
-            get_torch_device().manual_seed(gen_dp_rank + 1000)
-            self.gen_random_states = get_torch_device().get_rng_state()
-            get_torch_device().set_rng_state(self.torch_random_states)
-
             # 3.2 initialize rollout engine
             rollout_cls: type[BaseRollout] = get_rollout_class(rollout_config.name, rollout_config.mode)
             self.rollout = rollout_cls(
@@ -630,62 +624,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        """Context switch from rollout mode to trainer mode."""
-        if self.config.rollout.free_cache_engine:
-            log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
-            log_gpu_memory_usage("After rollout offload", logger=logger)
-
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(True)
-
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def wake_up(self):
-        """Context switch trainer mode to rollout mode."""
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(False)
-
-        per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
-        )
-
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
-
-        await self.rollout.update_weights(
-            per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done
-        )
-
-        if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
-
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
-        log_gpu_memory_usage("After resume kv_cache", logger=logger)
-
-        self.base_sync_done = True
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def prepare_for_rollout_launch(self):
-        if self._is_actor and self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        if self._is_ref and self.ref.engine.is_param_offload_enabled:
-            self.ref.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True)
-        set_expandable_segments(True)
-        return True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
@@ -796,7 +734,3 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         """
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        return self.rollout.get_zeromq_address()

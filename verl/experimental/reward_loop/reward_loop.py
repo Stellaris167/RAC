@@ -371,8 +371,6 @@ class RewardLoopManager:
         reward_extra_keys = list(reward_extra_infos[0].keys())
         non_tensor_batch = {}
         for key in reward_extra_keys:
-            if key in data.non_tensor_batch:
-                continue
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         if self.reward_model_manager is not None:

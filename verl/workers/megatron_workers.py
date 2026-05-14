@@ -565,12 +565,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
-        self.torch_random_states = get_torch_device().get_rng_state()
-        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
-        get_torch_device().manual_seed(gen_dp_rank + 1000)
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
-
         # Initialize base_sync_done for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.peft_merge: bool = model_config.lora.get("merge", False)
@@ -776,49 +770,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
 
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
-
         set_expandable_segments(True)
-
-    async def trainer_mode(self, skip_rollout_release: bool = False):
-        """Context switch hybridengine to trainer mode."""
-        rollout_engine_ready = getattr(self.rollout, "inference_engine", None) is not None
-        if self.config.rollout.free_cache_engine and not skip_rollout_release and rollout_engine_ready:
-            log_gpu_memory_usage("Before rollout offload", logger=logger)
-            await self.rollout.release()
-            log_gpu_memory_usage("After rollout offload", logger=logger)
-
-        for model in self.actor.actor_module:
-            model.train()
-
-        aggressive_empty_cache(force_sync=True)
-
-        if os.environ.get("MEGATRON_CI_DISABLE_EXPANDABLE_SEGMENTS", "0") == "0":
-            set_expandable_segments(True)
-
-        self.gen_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.torch_random_states)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def prepare_for_rollout_launch(self):
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params before rollout launch", logger=logger)
-        if self._is_offload_optimizer:
-            offload_megatron_optimizer(self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer before rollout launch", logger=logger)
-        if self._is_ref and self._ref_is_offload_param:
-            offload_megatron_model_to_cpu(self.ref_module)
-            log_gpu_memory_usage("After offload ref params before rollout launch", logger=logger)
-
-        await self.trainer_mode(skip_rollout_release=True)
-
-        set_expandable_segments(False)
-        aggressive_empty_cache(force_sync=True)
-        if os.environ.get("MEGATRON_CI_DISABLE_EXPANDABLE_SEGMENTS", "0") == "0":
-            set_expandable_segments(True)
-        return True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
@@ -1060,17 +1012,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 # Log a warning if memory snapshot fails. This might be expected if the profiler doesn't support it.
                 logger.warning(f"Failed to dump memory snapshot: {e}")
 
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        return self.rollout.get_zeromq_address()
-
 
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    async def sleep(self):
-        await self.trainer_mode()
-        return True
-
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
         await self.rollout_mode()

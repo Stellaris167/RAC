@@ -6,6 +6,7 @@ Converts to verl format: raw_prompt, data_source, reward_model, extra_info.
 Supports both Qwen-VL and InternVL message formats via prompt_col config.
 """
 from __future__ import annotations
+
 import copy
 import glob
 import json
@@ -13,6 +14,7 @@ import logging
 import os
 import re
 from typing import Optional
+
 import datasets
 import numpy as np
 import torch
@@ -141,8 +143,7 @@ class ConfidenceRLDataset(Dataset):
     ANSWER_COL = "answer"
     SOURCE_COL = "dataset_name"
     MC_COL = "is_multiple_choice"
-    META_KEYS = ("pair_id", "view", "noise_type", "noise_level",
-                 "corruption_level", "severity", "is_noisy")
+    META_KEYS = ("pair_id", "view", "noise_type", "noise_level", "corruption_level", "severity", "is_noisy")
 
     def __init__(
         self,
@@ -168,8 +169,9 @@ class ConfidenceRLDataset(Dataset):
 
     def _download(self):
         from verl.utils.fs import copy_to_local
-        for i, f in enumerate(self.data_files):
-            self.data_files[i] = copy_to_local(src=f, cache_dir=self.cache_dir)
+
+        for index, data_file in enumerate(self.data_files):
+            self.data_files[index] = copy_to_local(src=data_file, cache_dir=self.cache_dir)
 
     @staticmethod
     def _expand_path(path: str) -> list[str]:
@@ -184,24 +186,24 @@ class ConfidenceRLDataset(Dataset):
 
     def _read(self):
         resolved = []
-        for f in self.data_files:
-            resolved.extend(self._expand_path(f))
+        for data_file in self.data_files:
+            resolved.extend(self._expand_path(data_file))
         frames = []
-        for f in resolved:
-            if f.endswith(".parquet"):
-                df = datasets.load_dataset("parquet", data_files=f)["train"]
-            elif f.endswith(".json") or f.endswith(".jsonl"):
-                df = datasets.load_dataset("json", data_files=f)["train"]
+        for data_file in resolved:
+            if data_file.endswith(".parquet"):
+                dataset = datasets.load_dataset("parquet", data_files=data_file)["train"]
+            elif data_file.endswith(".json") or data_file.endswith(".jsonl"):
+                dataset = datasets.load_dataset("json", data_files=data_file)["train"]
             else:
-                raise ValueError(f"Unsupported format: {f}")
-            frames.append(df)
+                raise ValueError(f"Unsupported format: {data_file}")
+            frames.append(dataset)
         self.dataframe = datasets.concatenate_datasets(frames)
         total = len(self.dataframe)
         logger.info("Loaded %d samples from %d file(s)", total, len(self.data_files))
         if 0 < self.max_samples < total:
             rng = np.random.default_rng(42)
-            idx = rng.choice(total, size=self.max_samples, replace=False)
-            self.dataframe = self.dataframe.select(idx.tolist())
+            indices = rng.choice(total, size=self.max_samples, replace=False)
+            self.dataframe = self.dataframe.select(indices.tolist())
             logger.info("Sub-sampled to %d", self.max_samples)
 
     def __len__(self):
@@ -219,6 +221,7 @@ class ConfidenceRLDataset(Dataset):
             messages = raw
         else:
             messages = [{"role": "user", "content": str(raw)}]
+
         messages = copy.deepcopy(messages)
         if self.inject_confidence:
             messages = inject_confidence_prompt(messages)
@@ -228,10 +231,10 @@ class ConfidenceRLDataset(Dataset):
         if isinstance(row.get("extra_info"), dict):
             extra_info = dict(row["extra_info"])
         extra_info["is_multiple_choice"] = bool(row.get(self.MC_COL, True))
-        for k in self.META_KEYS:
-            v = row.get(k)
-            if v is not None:
-                extra_info[k] = v
+        for key in self.META_KEYS:
+            value = row.get(key)
+            if value is not None:
+                extra_info[key] = value
         choices = row.get("choices")
         if choices is not None:
             extra_info["choices"] = choices
@@ -239,10 +242,7 @@ class ConfidenceRLDataset(Dataset):
         condition_label = _format_condition_label(extra_info.get("corruption_level"))
         extra_info.setdefault("eval_condition", condition_label)
         split_data_source = self.config.get("split_data_source_by_corruption", True)
-        data_source = (
-            f"{base_data_source}@{condition_label}"
-            if split_data_source else base_data_source
-        )
+        data_source = f"{base_data_source}@{condition_label}" if split_data_source else base_data_source
         return {
             "raw_prompt": messages,
             "data_source": data_source,

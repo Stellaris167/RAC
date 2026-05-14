@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
-import types
+import os
+import re
 from collections.abc import Sequence
 
 import torch
@@ -18,6 +20,37 @@ IMG_START_TOKEN = "<img>"
 IMG_END_TOKEN = "</img>"
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 IMAGE_PLACEHOLDER = "<image>"
+_INTERNVL_IMAGE_TOKEN_BLOCK_RE = re.compile(
+    rf"{re.escape(IMG_START_TOKEN)}(?:{re.escape(IMG_CONTEXT_TOKEN)})+{re.escape(IMG_END_TOKEN)}"
+)
+
+
+class _InternVLImageProcessorProxy:
+    def __init__(self, patch_size: int):
+        self.patch_size = patch_size
+
+
+def bind_internvl_img_context_token_id(model, tokenizer=None, processor=None):
+    token_id = getattr(processor, "image_context_token_id", None)
+    if token_id is None and tokenizer is not None:
+        token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+    if token_id is None or token_id < 0:
+        raise ValueError("Failed to resolve InternVL <IMG_CONTEXT> token id from tokenizer/processor.")
+
+    pending = [model]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+
+        model_type = getattr(getattr(current, "config", None), "model_type", None)
+        if model_type in {"internvl_chat", "internvl"}:
+            current.img_context_token_id = int(token_id)
+
+        for attr in ("model", "module", "base_model", "language_model", "pretrained_model"):
+            pending.append(getattr(current, attr, None))
 
 
 def _build_transform(input_size: int):
@@ -104,8 +137,21 @@ def expand_internvl_image_tokens(prompt: str, num_patches_list: Sequence[int], n
     return expanded_prompt
 
 
+def collapse_internvl_image_tokens(prompt: str) -> str:
+    return _INTERNVL_IMAGE_TOKEN_BLOCK_RE.sub(IMAGE_PLACEHOLDER, prompt)
+
+
+def build_internvl_vllm_prompt_text(tokenizer, prompt_ids: Sequence[int]) -> str:
+    decoded_prompt = tokenizer.decode(
+        prompt_ids,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+    return collapse_internvl_image_tokens(decoded_prompt)
+
+
 class InternVLProcessor(ProcessorMixin):
-    attributes = ["image_processor", "tokenizer"]
+    attributes = ["tokenizer"]
 
     def __init__(self, tokenizer, config):
         self.tokenizer = tokenizer
@@ -122,7 +168,8 @@ class InternVLProcessor(ProcessorMixin):
         self.max_dynamic_patch = int(getattr(config, "max_dynamic_patch", 6))
         self.use_thumbnail = bool(getattr(config, "use_thumbnail", False))
         self.chat_template = getattr(tokenizer, "chat_template", None)
-        self.image_processor = types.SimpleNamespace(patch_size=self.patch_size)
+        self.audio_tokenizer = None
+        self.image_processor = _InternVLImageProcessorProxy(patch_size=self.patch_size)
         self._transform = _build_transform(self.image_size)
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
         self.image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
@@ -134,6 +181,43 @@ class InternVLProcessor(ProcessorMixin):
             for token_id in (self.image_token_id, self.image_context_token_id, self.image_end_token_id)
             if token_id is not None and token_id >= 0
         }
+
+    def to_dict(self, *args, **kwargs) -> dict:
+        return {
+            "processor_class": self.__class__.__name__,
+            "image_processor_type": "InternVLImageProcessorProxy",
+            "patch_size": self.patch_size,
+            "size": {"height": self.image_size, "width": self.image_size},
+            "min_dynamic_patch": self.min_dynamic_patch,
+            "max_dynamic_patch": self.max_dynamic_patch,
+            "use_thumbnail": self.use_thumbnail,
+            "downsample_ratio": self.downsample_ratio,
+            "image_mean": list(IMAGENET_MEAN),
+            "image_std": list(IMAGENET_STD),
+        }
+
+    def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
+        if push_to_hub:
+            raise NotImplementedError("InternVLProcessor.save_pretrained does not support push_to_hub.")
+
+        os.makedirs(save_directory, exist_ok=True)
+        save_jinja_files = kwargs.get("save_jinja_files", True)
+
+        if hasattr(self.tokenizer, "_set_processor_class"):
+            self.tokenizer._set_processor_class(self.__class__.__name__)
+        self.tokenizer.save_pretrained(save_directory, save_jinja_files=save_jinja_files)
+
+        processor_config_path = os.path.join(save_directory, "processor_config.json")
+        with open(processor_config_path, "w", encoding="utf-8") as writer:
+            json.dump(self.to_dict(), writer, ensure_ascii=False, indent=2, sort_keys=True)
+            writer.write("\n")
+
+        if self.chat_template is not None and save_jinja_files and isinstance(self.chat_template, str):
+            chat_template_path = os.path.join(save_directory, "chat_template.jinja")
+            with open(chat_template_path, "w", encoding="utf-8") as writer:
+                writer.write(self.chat_template)
+
+        return [processor_config_path]
 
     @property
     def model_input_names(self) -> list[str]:
@@ -194,7 +278,11 @@ class InternVLProcessor(ProcessorMixin):
         if num_patches_list:
             prompt = expand_internvl_image_tokens(prompt, num_patches_list, self.num_image_token)
 
-        tokenized = self.tokenizer(prompt, return_tensors=return_tensors or "pt")
+        # Agent-loop prompt budgeting truncates InternVL prompts after tokenization
+        # with visual-run-aware logic. Avoid the tokenizer's premature length warning
+        # for over-budget expanded prompts here so we do not emit a misleading
+        # "will result in indexing errors" message before that truncation happens.
+        tokenized = self.tokenizer(prompt, return_tensors=return_tensors or "pt", verbose=False)
         model_inputs = dict(tokenized)
         if pixel_values is not None:
             model_inputs["pixel_values"] = pixel_values

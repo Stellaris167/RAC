@@ -13,17 +13,11 @@
 # limitations under the License.
 
 import inspect
-import logging
-import os
-import random
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
-
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @register("naive")
@@ -99,24 +93,6 @@ class NaiveRewardManager(RewardManagerBase):
         else:
             score = result
             reward_extra_info["acc"] = score
-
-        if random.random() < 0.0001:
-            logger.warning(
-                "[sample-debug] raw_prompt=%s\n[sample-debug] response=%s\n[sample-debug] verifier=%s",
-                data_item.non_tensor_batch.get("raw_prompt"),
-                response_str,
-                reward_extra_info,
-            )
-
-        self.maybe_dump_prompt_response(
-            data_source=data_source,
-            ground_truth=ground_truth,
-            extra_info=extra_info,
-            raw_prompt=data_item.non_tensor_batch.get("raw_prompt"),
-            response_str=response_str,
-            reward_extra_info=reward_extra_info,
-            response_token_ids=valid_response_ids.detach().cpu().tolist(),
-        )
 
         reward = score
 

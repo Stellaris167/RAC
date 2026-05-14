@@ -13,45 +13,36 @@
 # limitations under the License.
 import argparse
 import asyncio
-import concurrent.futures
-import importlib
 import inspect
 import json
 import logging
 import os
-import sys
 from pprint import pprint
 from typing import Any, Callable, Optional
 
-import cloudpickle as pickle
 import ray
 import vllm.entrypoints.cli.serve
-import zmq
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
-from vllm.inputs import TokensPrompt
+from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
-from vllm.v1.executor.abstract import Executor
-
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.cuda_runtime import ensure_nvrtc_builtins_on_library_path
-from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available, set_expandable_segments
+from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.vllm import normalize_vllm_attention_backend_env
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
+from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -68,10 +59,10 @@ if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     if _VLLM_VERSION == version.parse("0.12.0"):
-        get_encoding = importlib.import_module("vllm.entrypoints.harmony_utils").get_encoding
+        from vllm.entrypoints.harmony_utils import get_encoding
 
     elif _VLLM_VERSION >= version.parse("0.13.0"):
-        get_encoding = importlib.import_module("vllm.entrypoints.openai.parser.harmony_utils").get_encoding
+        from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 
     else:
         get_encoding = None
@@ -85,154 +76,77 @@ else:
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
-
-def _sanitize_max_tokens(requested_tokens: Any, max_possible_tokens: int, source: str) -> int:
-    max_tokens = int(requested_tokens)
-    max_tokens = min(max_tokens, max_possible_tokens)
-    if max_tokens >= 1:
-        return max_tokens
-    if max_possible_tokens >= 1:
-        logger.warning("Adjusted %s from %s to 1 to satisfy generation constraints.", source, requested_tokens)
-        return 1
-    raise ValueError(
-        f"No room left for generation: {source}={requested_tokens}, max_possible_tokens={max_possible_tokens}. "
-        "Prompt consumed the full context window; truncate the prompt or increase max_model_len."
-    )
+_INTERNVL_IMAGE_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 
 
-def _configure_vllm_allocator(use_external_executor: bool, enable_sleep_mode: bool) -> None:
-    if use_external_executor:
-        set_expandable_segments(False)
-        logger.info("Disabled expandable_segments for vLLM external executor due to torch.cuda.MemPool limits.")
-    elif not enable_sleep_mode:
-        set_expandable_segments(True)
+def _collect_supported_cli_options(parser) -> set[str]:
+    supported_options: set[str] = set()
+    for action in parser._actions:
+        supported_options.update(getattr(action, "option_strings", []))
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                supported_options.update(_collect_supported_cli_options(subparser))
+    return supported_options
 
 
-class ExternalZeroMQDistributedExecutor(Executor):
-    uses_ray: bool = False
+def _filter_unsupported_cli_args(parser, cli_args: list[str]) -> list[str]:
+    supported_options = _collect_supported_cli_options(parser)
 
-    def _init_executor(self) -> None:
-        dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+    filtered_args: list[str] = []
+    index = 0
+    while index < len(cli_args):
+        arg = cli_args[index]
+        if not arg.startswith("--"):
+            filtered_args.append(arg)
+            index += 1
+            continue
 
-        addresses = os.environ["VERL_VLLM_ZMQ_ADDRESSES"].split(",")
-        addresses = addresses[dp_rank_local * tp_size : (dp_rank_local + 1) * tp_size]
-        self.context = zmq.Context()
-        self.sockets = []
-        for address in addresses:
-            socket = self.context.socket(zmq.REQ)
-            if address.startswith("tcp://["):
-                socket.setsockopt(zmq.IPV6, 1)
-            socket.connect(address)
-            self.sockets.append(socket)
+        option, has_inline_value, _ = arg.partition("=")
+        if option in supported_options:
+            filtered_args.append(arg)
+            index += 1
+            continue
 
-        parallel_cfg = getattr(self.vllm_config, "parallel_config", None)
-        distributed_init_method = "env://"
-        if parallel_cfg is not None:
-            explicit_init = getattr(parallel_cfg, "distributed_init_method", None)
-            if explicit_init:
-                distributed_init_method = explicit_init
-
-        kwargs = dict(
-            vllm_config=self.vllm_config,
-            local_rank=None,
-            rank=None,
-            distributed_init_method=distributed_init_method,
-            is_driver_worker=True,
-        )
-        self.collective_rpc("init_worker", args=([kwargs],))
-        self.collective_rpc("init_device")
-        self.collective_rpc("load_model")
-
-    if _VLLM_VERSION >= version.parse("0.12.0"):
-
-        def execute_model(self, scheduler_output, non_block: bool = False):
-            output = self.collective_rpc("execute_model", args=(scheduler_output,))
-            result = output[0]
-            if non_block:
-                future = concurrent.futures.Future()
-                future.set_result(result)
-                return future
-            return result
-
-        def sample_tokens(self, grammar_output, non_block: bool = False):
-            output = self.collective_rpc("sample_tokens", args=(grammar_output,))
-            result = output[0]
-            if non_block:
-                future = concurrent.futures.Future()
-                future.set_result(result)
-                return future
-            return result
-
-    def collective_rpc(
-        self,
-        method: str | Callable,
-        timeout: Optional[float] = None,
-        args: tuple = (),
-        kwargs: Optional[dict[str, Any]] = None,
-        **kwargs_extra: Any,
-    ) -> list[Any]:
-        if isinstance(method, str):
-            sent_method = method
+        logger.warning("Dropping unsupported vLLM CLI argument: %s", option)
+        if not has_inline_value and index + 1 < len(cli_args) and not cli_args[index + 1].startswith("--"):
+            index += 2
         else:
-            sent_method = pickle.dumps(method)
+            index += 1
 
-        message = pickle.dumps((sent_method, args, kwargs or {}))
-        for socket in self.sockets:
-            socket.send(message, zmq.DONTWAIT)
+    return filtered_args
 
-        outputs = []
-        for socket in self.sockets:
-            outputs.append(pickle.loads(socket.recv()))
 
-        for output in outputs:
-            if isinstance(output, Exception):
-                raise output
-        return outputs
+def _build_vllm_prompt(
+    *,
+    prompt_ids: list[int],
+    multi_modal_data: dict[str, Any],
+    prompt_text: Optional[str] = None,
+) -> TextPrompt | TokensPrompt:
+    if prompt_text is not None and multi_modal_data:
+        return {"prompt": prompt_text, "multi_modal_data": multi_modal_data}
 
-    def check_health(self):
-        return
-def _get_adapted_gpu_memory_utilization(configured_util: float, rollout_mode: RolloutMode) -> float:
-    if rollout_mode != RolloutMode.HYBRID:
-        return configured_util
+    return {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
 
-    try:
-        import torch
 
-        device_count = torch.cuda.device_count()
-        if device_count <= 0:
-            return configured_util
+def _build_worker_monkey_patch_kwargs(model_config: HFModelConfig) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"vocab_size": len(model_config.tokenizer)}
 
-        min_available_util = None
-        min_free_memory = None
-        min_total_memory = None
-        min_device_idx = None
-        for device_idx in range(device_count):
-            free_memory, total_memory = torch.cuda.mem_get_info(device_idx)
-            available_util = free_memory / total_memory
-            if min_available_util is None or available_util < min_available_util:
-                min_available_util = available_util
-                min_free_memory = free_memory
-                min_total_memory = total_memory
-                min_device_idx = device_idx
-    except Exception as exc:
-        logger.warning("Failed to inspect GPU memory before vLLM launch: %s", exc)
-        return configured_util
+    model_type = getattr(getattr(model_config, "hf_config", None), "model_type", None)
+    if model_type not in {"internvl_chat", "internvl"}:
+        return kwargs
 
-    if min_available_util is None or min_available_util >= configured_util:
-        return configured_util
+    processor = getattr(model_config, "processor", None)
+    token_id = getattr(processor, "image_context_token_id", None)
+    if token_id is None:
+        tokenizer = getattr(model_config, "tokenizer", None)
+        if tokenizer is not None and hasattr(tokenizer, "convert_tokens_to_ids"):
+            token_id = tokenizer.convert_tokens_to_ids(_INTERNVL_IMAGE_CONTEXT_TOKEN)
 
-    adapted_util = max(min_available_util * 0.9, 0.1)
-    logger.warning(
-        "Colocated mode: GPU%d free %.2f/%.2f GiB (%.1f%%), adapting utilization %.2f -> %.2f",
-        min_device_idx,
-        min_free_memory / 1024**3,
-        min_total_memory / 1024**3,
-        min_available_util * 100,
-        configured_util,
-        adapted_util,
-    )
-    return adapted_util
+    if token_id is None or int(token_id) < 0:
+        raise ValueError("Failed to resolve InternVL <IMG_CONTEXT> token id for vLLM worker patching.")
+
+    kwargs["img_context_token_id"] = int(token_id)
+    return kwargs
 
 
 class vLLMHttpServer:
@@ -266,13 +180,11 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
-        normalize_vllm_attention_backend_env()
-        added_paths = ensure_nvrtc_builtins_on_library_path()
-        if added_paths:
-            logger.info("Prepended NVRTC library paths to LD_LIBRARY_PATH: %s", added_paths)
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        self.tokenizer = getattr(self.model_config, "tokenizer", None)
+        self.processor = getattr(self.model_config, "processor", None)
         self._validate_configs()
 
         self.rollout_mode = rollout_mode
@@ -376,11 +288,11 @@ class vLLMHttpServer:
         override_generation_config = self._get_override_generation_config()
         logger.info(f"override_generation_config: {override_generation_config}")
 
-        use_external_executor = self.rollout_mode == RolloutMode.HYBRID and len(self.workers) > 0
         logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
-        _configure_vllm_allocator(
-            use_external_executor=use_external_executor, enable_sleep_mode=self.config.enable_sleep_mode
-        )
+        if not self.config.enable_sleep_mode:
+            from verl.utils.device import set_expandable_segments
+
+            set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
 
@@ -405,6 +317,7 @@ class vLLMHttpServer:
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
             "distributed_executor_backend": "mp",
+            "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
             "max_num_seqs": self.config.max_num_seqs,
@@ -425,14 +338,6 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
-
-        if not use_external_executor:
-            args["worker_extension_cls"] = self._get_worker_extension_cls()
-
-        args["gpu_memory_utilization"] = _get_adapted_gpu_memory_utilization(
-            configured_util=args["gpu_memory_utilization"], rollout_mode=self.rollout_mode
-        )
-        logger.info("Effective gpu_memory_utilization for vLLM launch: %.4f", args["gpu_memory_utilization"])
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -515,7 +420,6 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
-        args["enable_prefix_caching"] = False
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
@@ -530,27 +434,11 @@ class vLLMHttpServer:
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
-        server_args, unknown_args = parser.parse_known_args(args=server_args)
-        if unknown_args:
-            logger.warning(
-                "Ignoring unsupported vLLM CLI args for current version: %s",
-                " ".join(str(x) for x in unknown_args),
-            )
+        server_args = _filter_unsupported_cli_args(parser, server_args)
+        server_args = parser.parse_args(args=server_args)
         server_args.model = server_args.model_tag
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
-
-        if use_external_executor:
-            server_args.distributed_executor_backend = ExternalZeroMQDistributedExecutor
-            zmq_addresses = ray.get([worker.get_zeromq_address.remote() for worker in self.workers])
-            logger.info(
-                "replica_rank=%s, node_rank=%s, nnodes=%s, get worker zmq addresses: %s",
-                self.replica_rank,
-                self.node_rank,
-                self.nnodes,
-                zmq_addresses,
-            )
-            os.environ["VERL_VLLM_ZMQ_ADDRESSES"] = ",".join(zmq_addresses)
 
         # 3. launch server
         if self.node_rank == 0:
@@ -559,10 +447,6 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
-        _configure_vllm_allocator(
-            use_external_executor=getattr(args, "distributed_executor_backend", None) is ExternalZeroMQDistributedExecutor,
-            enable_sleep_mode=getattr(args, "enable_sleep_mode", True),
-        )
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -579,10 +463,7 @@ class vLLMHttpServer:
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
-        if getattr(args, "distributed_executor_backend", None) is not ExternalZeroMQDistributedExecutor:
-            await engine_client.collective_rpc(
-                method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
-            )
+        await engine_client.collective_rpc(method="monkey_patch_model", kwargs=_build_worker_monkey_patch_kwargs(self.model_config))
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
@@ -607,10 +488,6 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
-        _configure_vllm_allocator(
-            use_external_executor=getattr(args, "distributed_executor_backend", None) is ExternalZeroMQDistributedExecutor,
-            enable_sleep_mode=getattr(args, "enable_sleep_mode", True),
-        )
         args.api_server_count = 0
 
         def run_headless_wrapper():
@@ -637,6 +514,7 @@ class vLLMHttpServer:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
+        prompt_text: Optional[str] = None,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
@@ -667,27 +545,31 @@ class vLLMHttpServer:
                 self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
             )
 
-        max_tokens = _sanitize_max_tokens(max_tokens, max_possible_tokens, source="max_tokens")
+        # Clamp max_tokens to the valid range [0, max_possible_tokens]
+        max_tokens = max(0, min(max_tokens, max_possible_tokens))
 
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
-        if "min_tokens" in sampling_params:
-            sampling_params["min_tokens"] = _sanitize_max_tokens(
-                sampling_params["min_tokens"],
-                max_tokens,
-                source="min_tokens",
-            )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        sampling_params.setdefault("ignore_eos", self.config.ignore_eos)
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        default_stop_token_ids = self._get_default_stop_token_ids()
+        if default_stop_token_ids:
+            sampling_params.setdefault("stop_token_ids", default_stop_token_ids)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt = _build_vllm_prompt(
+            prompt_ids=prompt_ids,
+            multi_modal_data=multi_modal_data,
+            prompt_text=prompt_text,
+        )
 
         # Add lora request
         lora_request = None
@@ -742,8 +624,13 @@ class vLLMHttpServer:
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
 
+        prompt_token_ids = prompt_ids
+        if final_res.prompt_token_ids is not None:
+            prompt_token_ids = normalize_token_ids(final_res.prompt_token_ids)
+
         return TokenOutput(
             token_ids=token_ids,
+            prompt_token_ids=prompt_token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=stop_reason,
@@ -966,9 +853,33 @@ class vLLMHttpServer:
             temperature=self.config.temperature,
             top_k=self.config.top_k,
             top_p=self.config.top_p,
-            repetition_penalty=self.config.get("repetition_penalty", 1.0),
+            repetition_penalty=self.config.repetition_penalty,
             max_new_tokens=self.config.response_length,
         )
+
+    def _get_default_stop_token_ids(self) -> list[int]:
+        stop_token_ids: list[int] = []
+
+        generation_config = getattr(self.model_config, "generation_config", None)
+        eos_token_id = getattr(generation_config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            stop_token_ids.extend(int(token_id) for token_id in eos_token_id if token_id is not None)
+        elif eos_token_id is not None:
+            stop_token_ids.append(int(eos_token_id))
+
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+
+        tokenizer_eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if tokenizer_eos_token_id is not None:
+            stop_token_ids.append(int(tokenizer_eos_token_id))
+
+        deduped_stop_token_ids: list[int] = []
+        for token_id in stop_token_ids:
+            if token_id not in deduped_stop_token_ids:
+                deduped_stop_token_ids.append(token_id)
+        return deduped_stop_token_ids
 
     def _apply_quantization(self) -> tuple[Optional[str], dict]:
         """Process quantization config. Returns (quantization_str, hf_overrides)."""
@@ -990,9 +901,9 @@ class vLLMHttpServer:
             quant_method = quantization_config_dict.get("quant_method", None)
 
             if quant_method == "modelopt":
-                modelopt_module = importlib.import_module("verl.utils.modelopt")
+                from verl.utils.modelopt import apply_modelopt_nvfp4_patches
 
-                modelopt_module.apply_modelopt_nvfp4_patches()
+                apply_modelopt_nvfp4_patches()
                 quantization = "modelopt"
             elif quant_method == "compressed-tensors":
                 from verl.utils.qat import apply_qat_patches

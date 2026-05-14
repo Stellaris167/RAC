@@ -112,37 +112,6 @@ def get_generation_config(
             return None
 
 
-def get_text_config(hf_config):
-    """Return the text-specific sub-config if present, otherwise return the top-level config.
-
-    Some HF vision+language configs (e.g., `InternVLChatConfig`) embed text attributes
-    differently than Qwen-style configs. Use this helper to access text-related
-    attributes safely without raising AttributeError.
-    """
-    # Prefer explicit `text_config` attr
-    if hasattr(hf_config, "text_config") and getattr(hf_config, "text_config") is not None:
-        return hf_config.text_config
-
-    # Some configs expose a helper method to return a text sub-config
-    if hasattr(hf_config, "get_text_config") and callable(hf_config.get_text_config):
-        try:
-            tc = hf_config.get_text_config()
-            if tc is not None:
-                # If returned sub-config itself nests an llm_config, prefer that
-                if hasattr(tc, 'llm_config') and getattr(tc, 'llm_config') is not None:
-                    return tc.llm_config
-                return tc
-        except Exception:
-            pass
-
-    # InternVL-style configs may embed a Qwen LLM config under `llm_config`
-    if hasattr(hf_config, "llm_config") and getattr(hf_config, "llm_config") is not None:
-        return hf_config.llm_config
-
-    # Fallback to top-level config
-    return hf_config
-
-
 def create_huggingface_actor(model_name: str, override_config_kwargs=None, automodel_kwargs=None) -> nn.Module:
     """
 
@@ -666,6 +635,13 @@ def patch_valuehead_model(model) -> None:
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 
+    def _get_text_model_config(config):
+        for attr_name in ("text_config", "llm_config", "language_config"):
+            sub_config = getattr(config, attr_name, None)
+            if sub_config is not None:
+                return sub_config
+        return None
+
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
@@ -696,14 +672,10 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         attn_implementation="flash_attention_2",
         trust_remote_code=trust_remote_code,
     )
-    # vlm models: use safe accessor for text config
-    try:
-        text_cfg = get_text_config(model_config)
-        if hasattr(text_cfg, "hidden_size"):
-            ori_model.config.hidden_size = text_cfg.hidden_size
-    except Exception:
-        # best-effort: if text attributes are missing, continue without overriding
-        pass
+    # vlm models
+    text_model_config = _get_text_model_config(model_config)
+    if text_model_config is not None and hasattr(text_model_config, "hidden_size"):
+        ori_model.config.hidden_size = text_model_config.hidden_size
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)
     return model

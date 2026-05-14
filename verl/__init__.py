@@ -19,19 +19,21 @@ import os
 from packaging.version import parse as parse_version
 
 from .protocol import DataProto
-from .utils.cuda_runtime import ensure_nvrtc_builtins_on_library_path
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs
 from .utils.logging_utils import set_basic_config
 
-version_folder = os.path.dirname(os.path.join(os.path.abspath(__file__)))
+version_folder = os.path.dirname(os.path.abspath(__file__))
+version_file = os.path.join(version_folder, "version/version")
 
-with open(os.path.join(version_folder, "version/version")) as f:
-    __version__ = f.read().strip()
+try:
+    with open(version_file, encoding="utf-8") as f:
+        __version__ = f.read().strip()
+except FileNotFoundError:
+    __version__ = os.getenv("VERL_VERSION", "0.0.0")
 
 
 set_basic_config(level=logging.WARNING)
-ensure_nvrtc_builtins_on_library_path()
 
 
 __all__ = ["DataProto", "__version__"]

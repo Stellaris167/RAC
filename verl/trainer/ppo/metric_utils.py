@@ -22,9 +22,46 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+try:
+    from scipy import stats as scipy_stats
+except Exception:  # pragma: no cover
+    scipy_stats = None
+
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+_TRAIN_REWARD_EXTRA_METRIC_MAP = {
+    "ece": "calibration/ece",
+    "brier_score": "calibration/brier_score",
+    "pearson_r": "calibration/pearson_r",
+    "kendall_tau": "calibration/kendall_tau",
+    "kendall_tau_pvalue": "calibration/kendall_tau_pvalue",
+    "mean_confidence": "calibration/mean_confidence",
+    "mean_accuracy": "calibration/mean_accuracy",
+    "confidence_std": "calibration/confidence_std",
+    "accuracy_std": "calibration/accuracy_std",
+    "high_conf_error_ratio": "calibration/high_conf_error_ratio",
+    "overconfidence_rate": "calibration/overconfidence_rate",
+    "underconfidence_rate": "calibration/underconfidence_rate",
+    "conf_p10": "calibration/conf_p10",
+    "conf_p50": "calibration/conf_p50",
+    "conf_p90": "calibration/conf_p90",
+    "format_rate": "format/rate",
+    "clean_minus_noisy_conf": "reward_shaping/clean_minus_noisy_conf",
+    "pair_count": "reward_shaping/pair_count",
+    "mean_group_acc_var": "reward_shaping/mean_group_acc_var",
+    "mean_group_conf_var": "reward_shaping/mean_group_conf_var",
+    "rank_violation_rate": "reward_shaping/rank_violation_rate",
+}
+
+_VALIDATION_AGGREGATE_SOURCES = {
+    "overall": None,
+    "clean": frozenset({"clean"}),
+    "T0.2-T0.4": frozenset({"T0.2", "T0.4"}),
+    "T0.6-T1.0": frozenset({"T0.6", "T0.8", "T1.0"}),
+}
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -81,6 +118,196 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         prompt_length=prompt_length,
         response_length=response_length,
     )
+
+
+def _coerce_numeric_array(value: Any) -> np.ndarray | None:
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+
+    if array.size == 0:
+        return None
+
+    try:
+        flat = np.asarray(array, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
+        return None
+    return flat
+
+
+def _compute_reward_extra_metrics(batch: DataProto) -> dict[str, Any]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if not non_tensor_batch:
+        return {}
+
+    metrics = {}
+    for source_key, target_key in _TRAIN_REWARD_EXTRA_METRIC_MAP.items():
+        if source_key not in non_tensor_batch:
+            continue
+        flat = _coerce_numeric_array(non_tensor_batch[source_key])
+        if flat is None:
+            continue
+        metrics[target_key] = float(np.mean(flat))
+
+    for source_key, value in non_tensor_batch.items():
+        if not isinstance(source_key, str) or not source_key.startswith("ece_bin_"):
+            continue
+        flat = _coerce_numeric_array(value)
+        if flat is None:
+            continue
+        metrics[f"calibration/{source_key}"] = float(np.mean(flat))
+
+    return metrics
+
+
+def _binary_ece(conf: np.ndarray, acc: np.ndarray, n_bins: int = 10) -> float:
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for bin_index, (low, high) in enumerate(zip(bin_edges[:-1], bin_edges[1:])):
+        if bin_index == 0:
+            mask = (conf >= low) & (conf <= high)
+        else:
+            mask = (conf > low) & (conf <= high)
+        if mask.sum() == 0:
+            continue
+        ece += mask.mean() * abs(acc[mask].mean() - conf[mask].mean())
+    return float(ece)
+
+
+def _split_validation_data_source(data_source: str) -> tuple[str, str]:
+    text = str(data_source)
+    if "@" not in text:
+        return text, "clean"
+    base_source, condition = text.rsplit("@", 1)
+    return base_source or text, condition or "clean"
+
+
+def _group_validation_values_by_source_uid(
+    data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]]
+) -> dict[str, dict[str, dict[str, list[Any]]]]:
+    data_src2uid2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for sample_idx, data_source in enumerate(data_sources):
+        uid = str(sample_uids[sample_idx])
+        var2vals = data_src2uid2var2vals[str(data_source)][uid]
+        for var_name, var_vals in infos_dict.items():
+            var2vals[var_name].append(var_vals[sample_idx])
+    return data_src2uid2var2vals
+
+
+def _build_validation_aggregate_samples(
+    data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]]
+) -> tuple[list[str], list[str], dict[str, list[Any]]]:
+    aggregate_data_sources: list[str] = []
+    aggregate_sample_uids: list[str] = []
+    aggregate_infos_dict = {var_name: [] for var_name in infos_dict}
+
+    for sample_idx, data_source in enumerate(data_sources):
+        data_source = str(data_source)
+        _, condition = _split_validation_data_source(data_source)
+
+        target_sources = ["overall"]
+        if condition == "clean":
+            target_sources.append("clean")
+        elif condition in _VALIDATION_AGGREGATE_SOURCES["T0.2-T0.4"]:
+            target_sources.append("T0.2-T0.4")
+        elif condition in _VALIDATION_AGGREGATE_SOURCES["T0.6-T1.0"]:
+            target_sources.append("T0.6-T1.0")
+
+        aggregate_uid = f"{data_source}::{sample_uids[sample_idx]}"
+        for target_source in target_sources:
+            aggregate_data_sources.append(target_source)
+            aggregate_sample_uids.append(aggregate_uid)
+            for var_name, var_vals in infos_dict.items():
+                aggregate_infos_dict[var_name].append(var_vals[sample_idx])
+
+    return aggregate_data_sources, aggregate_sample_uids, aggregate_infos_dict
+
+
+def _compute_validation_calibration_values(confidences: list[float], accuracies: list[float]) -> dict[str, float]:
+    conf = _coerce_numeric_array(confidences)
+    acc = _coerce_numeric_array(accuracies)
+    if conf is None or acc is None:
+        return {}
+
+    size = min(conf.size, acc.size)
+    conf = conf[:size]
+    acc = acc[:size]
+
+    valid_mask = np.isfinite(conf) & np.isfinite(acc) & (conf >= 0)
+    if valid_mask.sum() == 0:
+        return {}
+
+    valid_confs = conf[valid_mask]
+    valid_accs = acc[valid_mask]
+    metrics = {
+        "ece": _binary_ece(valid_confs, valid_accs),
+        "brier_score": float(((valid_confs - valid_accs) ** 2).mean()),
+    }
+
+    if len(valid_confs) >= 5 and scipy_stats is not None:
+        try:
+            pearson_r, _ = scipy_stats.pearsonr(valid_confs, valid_accs)
+            metrics["pearson_r"] = float(pearson_r) if not np.isnan(pearson_r) else 0.0
+        except Exception:
+            metrics["pearson_r"] = 0.0
+    else:
+        metrics["pearson_r"] = 0.0
+
+    return metrics
+
+
+def _compute_validation_group_calibration_metrics(
+    data_src2uid2var2vals: dict[str, dict[str, dict[str, list[Any]]]]
+) -> dict[str, dict[str, dict[str, float]]]:
+    data_src2var2metric2val = defaultdict(lambda: defaultdict(dict))
+    for data_source, uid2var2vals in data_src2uid2var2vals.items():
+        confidences = []
+        accuracies = []
+        for var2vals in uid2var2vals.values():
+            conf = _coerce_numeric_array(var2vals.get("confidence", []))
+            acc = _coerce_numeric_array(var2vals.get("acc", []))
+            if conf is None or acc is None:
+                continue
+            confidences.append(float(conf.mean()))
+            accuracies.append(float(acc.mean()))
+
+        calibration_metrics = _compute_validation_calibration_values(confidences, accuracies)
+        if calibration_metrics:
+            data_src2var2metric2val[data_source]["calibration"].update(calibration_metrics)
+
+    return data_src2var2metric2val
+
+
+def format_validation_metric_dict(data_src2var2metric2val: dict[str, dict[str, dict[str, float]]]) -> dict[str, float]:
+    metric_dict = {}
+    for data_source, var2metric2val in data_src2var2metric2val.items():
+        core_var = "acc" if "acc" in var2metric2val else "reward"
+        for var_name, metric2val in var2metric2val.items():
+            ns = []
+            for metric_name in metric2val.keys():
+                if "@" not in metric_name:
+                    continue
+                try:
+                    ns.append(int(metric_name.split("@")[-1].split("/")[0]))
+                except ValueError:
+                    continue
+            n_max = max(ns) if ns else None
+
+            for metric_name, metric_val in metric2val.items():
+                is_core_metric = (
+                    n_max is not None
+                    and var_name == core_var
+                    and any(metric_name.startswith(prefix) for prefix in ("mean", "maj", "best"))
+                    and (f"@{n_max}" in metric_name)
+                )
+                metric_sec = "val-core" if is_core_metric else "val-aux"
+                metric_dict[f"{metric_sec}/{data_source}/{var_name}/{metric_name}"] = metric_val
+    return metric_dict
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
@@ -224,6 +451,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    metrics.update(_compute_reward_extra_metrics(batch))
 
     return metrics
 
@@ -555,13 +784,31 @@ def process_validation_metrics(
         >>> result = process_validation_metrics(data_sources, sample_uids, infos_dict)
         >>> # result will contain statistics for each data source and variable
     """
-    # Group metrics by data source, prompt and variable
-    data_src2uid2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for sample_idx, data_source in enumerate(data_sources):
-        uid = sample_uids[sample_idx]
-        var2vals = data_src2uid2var2vals[data_source][uid]
-        for var_name, var_vals in infos_dict.items():
-            var2vals[var_name].append(var_vals[sample_idx])
+    data_src2uid2var2vals = _group_validation_values_by_source_uid(data_sources, sample_uids, infos_dict)
+
+    data_src2var2metric2val = _process_validation_metrics_from_grouped_values(data_src2uid2var2vals, seed=seed)
+
+    aggregate_data_sources, aggregate_sample_uids, aggregate_infos_dict = _build_validation_aggregate_samples(
+        data_sources, sample_uids, infos_dict
+    )
+    if aggregate_data_sources:
+        aggregate_src2uid2var2vals = _group_validation_values_by_source_uid(
+            aggregate_data_sources, aggregate_sample_uids, aggregate_infos_dict
+        )
+        aggregate_metrics = _process_validation_metrics_from_grouped_values(aggregate_src2uid2var2vals, seed=seed)
+        aggregate_calibration_metrics = _compute_validation_group_calibration_metrics(aggregate_src2uid2var2vals)
+
+        for data_source, var2metric2val in aggregate_metrics.items():
+            data_src2var2metric2val[data_source].update(var2metric2val)
+        for data_source, var2metric2val in aggregate_calibration_metrics.items():
+            data_src2var2metric2val[data_source].update(var2metric2val)
+
+    return data_src2var2metric2val
+
+
+def _process_validation_metrics_from_grouped_values(
+    data_src2uid2var2vals: dict[str, dict[str, dict[str, list[Any]]]], seed: int = 42
+) -> dict[str, dict[str, dict[str, float]]]:
 
     np_mean = np.mean
     np_std = np.std

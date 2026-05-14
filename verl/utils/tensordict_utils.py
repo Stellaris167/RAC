@@ -483,31 +483,6 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
     return selected_batch
 
 
-def split_tensordict(td: TensorDict, split_size: int) -> list[TensorDict]:
-    """Split a TensorDict into batches of at most ``split_size`` rows.
-
-    Unlike direct ``td[start:end]`` slicing, this helper supports jagged
-    NestedTensor fields by delegating row selection to
-    ``index_select_tensor_dict``.
-
-    Args:
-        td: The TensorDict to split.
-        split_size: Maximum number of rows per split. Must be positive.
-
-    Returns:
-        A list of TensorDict chunks. The last chunk may be smaller than
-        ``split_size``.
-    """
-    assert isinstance(td, TensorDict), f"expected TensorDict, got {type(td)}"
-    assert split_size > 0, f"split_size must be positive, got {split_size}"
-
-    total_size = len(td)
-    return [
-        index_select_tensor_dict(td, list(range(start_idx, min(start_idx + split_size, total_size))))
-        for start_idx in range(0, total_size, split_size)
-    ]
-
-
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Merge two TensorDicts, adding keys from the second to the first.
 

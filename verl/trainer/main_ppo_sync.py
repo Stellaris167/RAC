@@ -69,11 +69,20 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    format_validation_metric_dict,
     process_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_teacher_policy,
+    resolve_validation_batch_size,
+    should_run_initial_validation,
+)
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -282,7 +291,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
-            repetition_penalty=config.get("repetition_penalty", 1.0),
+            repetition_penalty=config.repetition_penalty,
             logprobs=config.calculate_log_probs,
         )
 
@@ -358,9 +367,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         final_responses = torch.tensor(final_output.response_ids, dtype=torch.int64)
         final_input_ids = torch.cat([final_prompts, final_responses], dim=0)
         final_attention_mask = torch.ones_like(final_input_ids, dtype=torch.int64)
-        final_multi_modal_inputs = self._compute_multi_modal_inputs(
-            final_output, final_input_ids.unsqueeze(0), final_attention_mask.unsqueeze(0)
-        )
+        final_multi_modal_inputs = self._compute_multi_modal_inputs(final_output, final_input_ids)
         final_position_ids = self._compute_position_ids(
             final_input_ids.unsqueeze(0), final_attention_mask.unsqueeze(0), final_multi_modal_inputs
         ).squeeze(0)
@@ -390,9 +397,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
             attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-            multi_modal_inputs = self._compute_multi_modal_inputs(
-                output, input_ids.unsqueeze(0), attention_mask.unsqueeze(0)
-            )
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
             position_ids = self._compute_position_ids(
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
@@ -519,10 +524,7 @@ class PPOTrainer:
         local_path = copy_to_local(
             self.config.actor_rollout_ref.model.path, use_shm=self.config.actor_rollout_ref.model.get("use_shm", False)
         )
-        # Keep dataset-side tokenizer/processor aligned with the model-side loading path.
-        trust_remote_code = self.config.actor_rollout_ref.model.get(
-            "trust_remote_code", self.config.data.get("trust_remote_code", False)
-        )
+        trust_remote_code = self.config.data.get("trust_remote_code", False)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
@@ -556,7 +558,7 @@ class PPOTrainer:
         )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
-            batch_size=self.config.data.val_batch_size or len(self.val_dataset),
+            batch_size=resolve_validation_batch_size(self.config, len(self.val_dataset)),
             num_workers=self.config.data["dataloader_num_workers"],
             shuffle=self.config.data.get("validation_shuffle", True),
             drop_last=False,
@@ -935,22 +937,7 @@ class PPOTrainer:
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+        metric_dict = format_validation_metric_dict(data_src2var2metric2val)
 
         if len(sample_turns) > 0:
             sample_turns = np.array(sample_turns)
@@ -1045,16 +1032,11 @@ class PPOTrainer:
             return
 
         # 1. compute log probs
-        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
-            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
-        )
-        batch.extra_info.update({"calculate_entropy": calculate_entropy, "compute_loss": False})
+        batch.extra_info.update({"calculate_entropy": True, "compute_loss": False})
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
-        fields = ["log_probs", "response_mask"]
-        if calculate_entropy:
-            fields.append("entropy")
+        fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
         t_start = time.time()
@@ -1064,14 +1046,10 @@ class PPOTrainer:
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        if calculate_entropy:
-            data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
         t_start = time.time()
-        fields_to_put = ["old_log_probs"]
-        if calculate_entropy:
-            fields_to_put.append("entropy")
         tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*fields_to_put)
+            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
         )
         t_end = time.time()
         print(f"[DEBUG] _compute_old_log_prob time to put data: {t_end - t_start:.2f}", flush=True)
@@ -1079,19 +1057,18 @@ class PPOTrainer:
         data = DataProto(batch=data.to_padded_tensor())
 
         # 3. calculate actor entroy metrics
-        if calculate_entropy:
-            actor_config = self.config.actor_rollout_ref.actor
-            entropy_agg = agg_loss(
-                loss_mat=data.batch["entropy"],
-                loss_mask=data.batch["response_mask"],
-                loss_agg_mode=actor_config.loss_agg_mode,
-                loss_scale_factor=actor_config.loss_scale_factor,
-            )
-            old_log_prob_metrics = {
-                "actor/entropy": entropy_agg.detach().item(),
-                # "perf/mfu/actor_infer": old_log_prob_mfu,
-            }
-            metrics.update(old_log_prob_metrics)
+        actor_config = self.config.actor_rollout_ref.actor
+        entropy_agg = agg_loss(
+            loss_mat=data.batch["entropy"],
+            loss_mask=data.batch["response_mask"],
+            loss_agg_mode=actor_config.loss_agg_mode,
+            loss_scale_factor=actor_config.loss_scale_factor,
+        )
+        old_log_prob_metrics = {
+            "actor/entropy": entropy_agg.detach().item(),
+            # "perf/mfu/actor_infer": old_log_prob_mfu,
+        }
+        metrics.update(old_log_prob_metrics)
 
         # 4. calculate rollout vs actor logprobs diff
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -1319,14 +1296,13 @@ class PPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
 
-        # perform validation before training
-        if self.config.trainer.get("val_before_train", True):
+        # Skip step-0 validation during normal training. Keep validation-only mode working.
+        if should_run_initial_validation(self.config):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+            return
 
         current_epoch = self.global_steps // len(self.train_dataloader)
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")

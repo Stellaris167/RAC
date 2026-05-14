@@ -1,7 +1,0 @@
-wandb: Detected [openai] in use.
-wandb: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
-wandb: For more information, check out the docs at: https://weave-docs.wandb.ai/
-Found checkpoint: %s /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/checkpoints/qwen2.5vl7b-grpo-baseline/global_step_62
-Load from checkpoint folder: /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/checkpoints/qwen2.5vl7b-grpo-baseline/global_step_62
-Setting global step to 62
-Resuming from /share/home/cuipeng/cuipeng_a100/yangboyao/RLC/checkpoints/qwen2.5vl7b-grpo-baseline/global_step_62
