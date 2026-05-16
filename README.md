@@ -1,6 +1,18 @@
 # RAC: Ranking-Aware Calibration for Reliable Multimodal Reinforcement Learning
 
-Official code repository for "Ranking-Aware Calibration for Reliable Multimodal Reinforcement Learning".
+<p align="center">
+  <a href="https://opensource.org/licenses/Apache-2.0">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0">
+  </a>
+  <a href="https://arxiv.org/">
+    <img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b.svg" alt="arXiv">
+  </a>
+  <a href="https://www.python.org/downloads/">
+    <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+">
+  </a>
+</p>
+
+Welcome to our repo! This is the official code repository for *Ranking-Aware Calibration for Reliable Multimodal Reinforcement Learning*. 😊
 
 RAC is a training-time calibration framework for multimodal reinforcement learning. Standard outcome rewards improve reasoning accuracy, but they do not explicitly teach a model when to lower confidence, especially under corrupted visual evidence. RAC adds two relative supervision signals that already exist in group-based RL rollouts:
 
@@ -8,7 +20,10 @@ RAC is a training-time calibration framework for multimodal reinforcement learni
 - Clean-corrupted pairwise loss: confidence should decrease as the visual evidence is degraded.
 
 We instantiate RAC on Qwen2.5-VL and InternVL-3.5 backbones and evaluate on six multimodal reasoning benchmarks under clean and corrupted inputs. The code in this repository is a cleaned research release built on top of verl, keeping only the components needed to reproduce the RAC training and data pipeline.
-![alt text](assets/image.png)
+
+<p align="center">
+  <img src="assets/image.png" alt="RAC overview">
+</p>
 
 ## Overview
 
@@ -17,7 +32,7 @@ RAC targets a simple failure mode in multimodal RL: a model can learn to produce
 - Ranking-aware calibration: confidence should rank candidate rollouts by reasoning quality within the same question.
 - Corruption-aware calibration: confidence should attenuate when the same question is observed through lower-quality visual evidence.
 
-These signals are converted into reward shaping terms and optimized jointly with the base RL objective.
+These signals are converted into reward shaping terms and optimized jointly with the base RL objective. 🎉
 
 ## What Is In This Repository
 
