@@ -4,8 +4,8 @@
   <a href="https://opensource.org/licenses/Apache-2.0">
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0">
   </a>
-  <a href="https://arxiv.org/">
-    <img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b.svg" alt="arXiv">
+  <a href="https://arxiv.org/abs/2605.16999">
+  <img src="https://img.shields.io/badge/arXiv-2605.16999-b31b1b.svg" alt="arXiv:2605.16999">
   </a>
   <a href="https://www.python.org/downloads/">
     <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+">
