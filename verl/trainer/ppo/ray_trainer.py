@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.rac import prepare_rac_batch
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -74,6 +75,18 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def resolve_run_training_steps(total_training_steps: int, configured_steps: Optional[int]) -> int:
+    """Keep the optimizer schedule horizon while allowing an earlier run stop."""
+    if configured_steps is None:
+        return total_training_steps
+    run_training_steps = int(configured_steps)
+    if not 1 <= run_training_steps <= total_training_steps:
+        raise ValueError(
+            f"trainer.run_training_steps must be in [1, {total_training_steps}], got {run_training_steps}"
+        )
+    return run_training_steps
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -410,7 +423,13 @@ class RayPPOTrainer:
             total_training_steps = self.config.trainer.total_training_steps
 
         self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
+        self.run_training_steps = resolve_run_training_steps(
+            total_training_steps, self.config.trainer.get("run_training_steps", None)
+        )
+        print(
+            f"Optimizer schedule steps: {self.total_training_steps}, "
+            f"run steps: {self.run_training_steps}"
+        )
 
         try:
             OmegaConf.set_struct(self.config, True)
@@ -443,6 +462,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: value.item() if isinstance(value, np.generic) else value for k, value in entry.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
@@ -640,15 +660,20 @@ class RayPPOTrainer:
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
+        data_sources = np.concatenate(data_source_lst, axis=0)
+
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            dump_extra_infos = dict(reward_extra_infos_dict)
+            dump_extra_infos["data_source"] = data_sources.tolist()
+            dump_extra_infos["uid"] = sample_uids
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=dump_extra_infos,
                 dump_path=val_data_dir,
             )
 
@@ -663,7 +688,6 @@ class RayPPOTrainer:
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
-        data_sources = np.concatenate(data_source_lst, axis=0)
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
@@ -1332,7 +1356,7 @@ class RayPPOTrainer:
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(total=self.run_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
@@ -1376,7 +1400,7 @@ class RayPPOTrainer:
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
-                is_last_step = self.global_steps >= self.total_training_steps
+                is_last_step = self.global_steps >= self.run_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -1567,6 +1591,8 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        if "rac_loss_weights" in batch.meta_info:
+                            prepare_rac_batch(batch, self.tokenizer)
 
                     # update critic
                     if self.use_critic:

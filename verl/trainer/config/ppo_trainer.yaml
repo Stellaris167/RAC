@@ -121,6 +121,9 @@ trainer:
   # Total training steps (can be set explicitly or derived from epochs)
   total_training_steps: null
 
+  # Optional earlier stop that does not change the optimizer schedule horizon
+  run_training_steps: null
+
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples
 

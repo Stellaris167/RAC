@@ -144,11 +144,12 @@ ENV/
 *.parquet
 *.tex
 
-# debug
-tests/
+# tests
+.pytest_cache/
 
 # local logs
 logs
 log
+volc_logs/
 outputs
 .history

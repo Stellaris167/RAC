@@ -54,6 +54,34 @@ def once(func):
     return wrapper
 
 
+def _drop_none_fields(value):
+    if isinstance(value, dict):
+        return {key: _drop_none_fields(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_drop_none_fields(item) for item in value]
+    return value
+
+
+def _mask_assistant_content(loss_mask, input_ids, empty_assistant_ids, *, include_terminator):
+    shared_prefix = 0
+    while (
+        shared_prefix < min(len(input_ids), len(empty_assistant_ids))
+        and input_ids[shared_prefix] == empty_assistant_ids[shared_prefix]
+    ):
+        shared_prefix += 1
+
+    shared_suffix = 0
+    while (
+        shared_suffix < min(len(input_ids), len(empty_assistant_ids)) - shared_prefix
+        and input_ids[-shared_suffix - 1] == empty_assistant_ids[-shared_suffix - 1]
+    ):
+        shared_suffix += 1
+
+    loss_mask.zero_()
+    content_end = len(input_ids) if include_terminator else len(input_ids) - shared_suffix
+    loss_mask[shared_prefix:content_end] = 1
+
+
 @once
 def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_mask, tools):
     """
@@ -231,8 +259,29 @@ class MultiTurnSFTDataset(Dataset):
 
         if message["role"] == "assistant":
             loss_mask = torch.ones_like(attention_mask)
-            # mask out generation prompt if assistant message
-            loss_mask[: len(self.generation_prompt)] = 0
+            empty_message = {
+                **message,
+                "content": "" if isinstance(message["content"], str) else [{"type": "text", "text": ""}],
+            }
+            empty_inputs = apply_chat_template(
+                processor,
+                messages=[empty_message],
+                tools=tools,
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                **apply_chat_template_kwargs,
+            )
+            empty_input_ids = empty_inputs["input_ids"][0]
+            if index != 0:
+                empty_input_ids = empty_input_ids[len(self.system_prompt) :]
+            _mask_assistant_content(
+                loss_mask,
+                input_ids,
+                empty_input_ids,
+                include_terminator=not message.get("partial", False),
+            )
         else:
             loss_mask = torch.zeros_like(attention_mask)
 
@@ -250,7 +299,7 @@ class MultiTurnSFTDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = convert_nested_value_to_list_recursive(example[self.messages_key])
+        messages: list = _drop_none_fields(convert_nested_value_to_list_recursive(example[self.messages_key]))
         images = example[self.image_key] if self.image_key in example else []
         videos = example[self.video_key] if self.video_key in example else []
 

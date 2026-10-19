@@ -32,7 +32,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_name, is_npu_available, set_expandable_segments
+from verl.utils.device import get_device_id, get_device_name, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
@@ -331,6 +331,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
+
+        if "rac_loss_weights" in data:
+            counts = torch.stack([data["reasoning_mask"].sum(), data["confidence_mask"].sum()]).to(get_device_id())
+            torch.distributed.all_reduce(counts, group=self.engine.get_data_parallel_group())
+            tu.assign_non_tensor_data(
+                data,
+                "rac_batch_num_tokens",
+                dict(zip(("task", "confidence"), counts.tolist(), strict=True)),
+            )
 
         # inject engineering parameters if not specified
         default_keys = dict(

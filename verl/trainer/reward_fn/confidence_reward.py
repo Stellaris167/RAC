@@ -8,6 +8,7 @@ Returns dict with rich per-sample metrics for case study analysis:
 import re
 import math
 import json
+from verl.trainer.reward_fn.response_fields import last_box, box_answer, confidence_value_span
 
 _RE_ANSWER = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _RE_CONFIDENCE = re.compile(r"<confidence>\s*(.*?)\s*</confidence>", re.DOTALL | re.IGNORECASE)
@@ -60,7 +61,32 @@ def _parse_float_like(value: str | None) -> float | None:
         return None
 
 
+def _find_last_match(pattern: re.Pattern, text: str):
+    last = None
+    for m in pattern.finditer(text):
+        last = m
+    return last
+
+
+def _extract_box_payload(text: str) -> str | None:
+    box = last_box(text)
+    return box.payload.strip() if box else None
+
+
+def extract_box_answer(text: str) -> str | None:
+    box = last_box(text, allow_unclosed=True)
+    return box_answer(box) if box else None
+
+
+def _extract_box_confidence_raw(text: str) -> float | None:
+    parsed = confidence_value_span(text) if last_box(text, allow_unclosed=True) else None
+    return parsed[0] if parsed else None
+
+
 def _extract_confidence_raw(text: str) -> float | None:
+    if last_box(text, allow_unclosed=True) is not None:
+        return _extract_box_confidence_raw(text)
+
     m = _RE_CONFIDENCE.search(text)
     if m:
         return _parse_float_like(m.group(1))
@@ -100,11 +126,14 @@ def _extract_plain_answer(text: str, is_multiple_choice: bool, choices=None) -> 
     matched = _RE_PLAIN_ANSWER.search(cleaned)
     if matched:
         cleaned = matched.group(1).strip()
+    cleaned = re.split(r"\b(?:confidence|conf|certainty|probability)\s*[:=]", cleaned, maxsplit=1, flags=re.I)[0].strip().rstrip(";,")
+    if not cleaned:
+        return None
 
     if is_multiple_choice:
-        option = _extract_option_letter(cleaned)
+        option = _RE_OPTION_TOKEN.search(cleaned)
         if option:
-            return option
+            return option.group(1).upper()
 
         choice_map = _parse_choices(choices)
         cleaned_lower = cleaned.lower()
@@ -115,10 +144,20 @@ def _extract_plain_answer(text: str, is_multiple_choice: bool, choices=None) -> 
     return cleaned or None
 
 
-def extract_answer(text: str, is_multiple_choice: bool, choices=None) -> tuple[str | None, str]:
+def extract_answer(text: str, is_multiple_choice: bool, choices=None, response_schema: str = "tags") -> tuple[str | None, str]:
+    if response_schema == "boxed":
+        boxed = extract_box_answer(text)
+        if last_box(text, allow_unclosed=True) is not None:
+            return boxed, "box" if boxed is not None else "missing"
+
     tagged = extract_answer_tag(text)
     if tagged is not None:
         return tagged, "tag"
+
+    if response_schema != "boxed":
+        boxed = extract_box_answer(text)
+        if boxed is not None:
+            return boxed, "box"
 
     plain = _extract_plain_answer(text, is_multiple_choice=is_multiple_choice, choices=choices)
     if plain is not None:
@@ -128,20 +167,29 @@ def extract_answer(text: str, is_multiple_choice: bool, choices=None) -> tuple[s
 
 def extract_confidence_tag(text: str) -> float:
     raw_conf = _extract_confidence_raw(text)
-    if raw_conf is None:
+    if raw_conf is None or not math.isfinite(raw_conf) or not 0.0 <= raw_conf <= 1.0:
         return -1.0
-
-    v = raw_conf
-    if v > 1.0:
-        v /= 100.0
-    return max(0.0, min(1.0, v))
+    return raw_conf
 
 
-def _find_last_match(pattern: re.Pattern, text: str):
-    last = None
-    for m in pattern.finditer(text):
-        last = m
-    return last
+def answer_skip_reason(pred: str | None, text: str, is_mc: bool, choices=None) -> str:
+    if pred is None or not pred.strip() or pred.strip().lower() in {"answer", "none", "null", "nan"}:
+        return "missing_answer"
+    # Long periodic decimals and bare numeric sequences are observed rollout loops.
+    box = last_box(text, allow_unclosed=True)
+    payload = box.payload if box is not None else pred + " " + " ".join(_RE_CONFIDENCE.findall(text))
+    if re.search(r"\.\d*?(\d{1,4})\1{11,}", payload):
+        return "numeric_repetition"
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    if re.fullmatch(rf"{number}(?:\s+{number})+", pred.strip()):
+        return "ambiguous_numeric_sequence"
+    if re.search(r"\b(?:answer|confidence|certainty|probability)\b", pred, re.I):
+        return "malformed_answer_field"
+    if is_mc and not _answer_payload_format_ok(_normalise(pred), True):
+        choice_texts = [value.strip().lower() for value in _parse_choices(choices).values()]
+        if pred.strip().lower() not in choice_texts:
+            return "missing_option"
+    return ""
 
 
 def _trailing_text_after_confidence(text: str) -> str:
@@ -151,13 +199,31 @@ def _trailing_text_after_confidence(text: str) -> str:
     return text[last_conf.end():].strip()
 
 
+def _trailing_text_after_box(text: str) -> str:
+    box = last_box(text)
+    if box is None:
+        return ""
+    return text[box.end:].strip()
+
+
 def _schema_compliance_score(
     text: str,
     *,
     is_multiple_choice: bool = False,
     choices=None,
+    response_schema: str = "tags",
 ) -> float:
     """Return a soft schema score in [0, 1] for format-failed samples."""
+    if response_schema == "boxed":
+        box_payload = _extract_box_payload(text)
+        has_think = 1.0 if _RE_THINK.search(text) is not None else 0.0
+        has_box = 1.0 if box_payload is not None else 0.0
+        answer_payload_ok = 1.0 if _answer_payload_format_ok(extract_box_answer(text), is_multiple_choice) else 0.0
+        conf_value_ok = 1.0 if _extract_box_confidence_raw(text) is not None else 0.0
+        no_tail_after_box = 1.0 if (box_payload is not None and _trailing_text_after_box(text) == "") else 0.0
+        soft = 0.20 * has_think + 0.30 * has_box + 0.20 * answer_payload_ok + 0.20 * conf_value_ok + 0.10 * no_tail_after_box
+        return float(max(0.0, min(1.0, soft)))
+
     answer_m = _RE_ANSWER.search(text)
     conf_m = _RE_CONFIDENCE.search(text)
     think_m = _RE_THINK.search(text)
@@ -182,7 +248,19 @@ def _schema_compliance_score(
     return float(max(0.0, min(1.0, soft)))
 
 
-def check_format(text: str, is_multiple_choice: bool = False, choices=None) -> bool:
+def check_format(text: str, is_multiple_choice: bool = False, choices=None, response_schema: str = "tags") -> bool:
+    if response_schema == "boxed":
+        payload = _extract_box_payload(text)
+        if payload is None or re.fullmatch(r"answer=.+;\s*confidence=(?:0(?:\.\d+)?|1(?:\.0+)?)", payload) is None:
+            return False
+        if _extract_box_payload(text) is None:
+            return False
+        if _extract_box_confidence_raw(text) is None:
+            return False
+        if not _answer_payload_format_ok(extract_box_answer(text), is_multiple_choice=is_multiple_choice):
+            return False
+        return _trailing_text_after_box(text) == ""
+
     answer_m = _RE_ANSWER.search(text)
     conf_m = _RE_CONFIDENCE.search(text)
     if answer_m is None or conf_m is None:
@@ -314,16 +392,27 @@ def compute_score(
     extra_info = extra_info or {}
     is_mc = bool(extra_info.get("is_multiple_choice", True))
     choices = extra_info.get("choices")
+    response_schema = kwargs.get("response_schema", extra_info.get("response_schema", "tags"))
+    if response_schema not in {"tags", "boxed"}:
+        raise ValueError(f"Unsupported response_schema={response_schema!r}; use 'tags' or 'boxed'.")
     fmt_coef = _resolve_format_coef(extra_info, kwargs)
     tail_penalty_coef = float(kwargs.get("tail_text_penalty_coef", extra_info.get("tail_text_penalty_coef", 0.2)))
     schema_bonus_coef = float(kwargs.get("schema_bonus_coef", extra_info.get("schema_bonus_coef", 0.0)))
     schema_bonus_cap_ratio = float(kwargs.get("schema_bonus_cap_ratio", extra_info.get("schema_bonus_cap_ratio", 0.8)))
-    pred, answer_source = extract_answer(solution_str, is_multiple_choice=is_mc, choices=choices)
+    pred, answer_source = extract_answer(
+        solution_str, is_multiple_choice=is_mc, choices=choices, response_schema=response_schema
+    )
     conf = extract_confidence_tag(solution_str)
-    answer_tag_payload = extract_answer_tag(solution_str)
-    answer_format_ok = 1.0 if _answer_payload_format_ok(answer_tag_payload, is_multiple_choice=is_mc) else 0.0
-    fmt_ok = 1.0 if check_format(solution_str, is_multiple_choice=is_mc, choices=choices) else 0.0
-    trailing_text = _trailing_text_after_confidence(solution_str)
+    answer_payload = extract_box_answer(solution_str) if response_schema == "boxed" else extract_answer_tag(solution_str)
+    answer_format_ok = 1.0 if _answer_payload_format_ok(answer_payload, is_multiple_choice=is_mc) else 0.0
+    skip_reason = answer_skip_reason(pred, solution_str, is_mc, choices)
+    accuracy_valid = not skip_reason
+    fmt_ok = 1.0 if check_format(
+        solution_str, is_multiple_choice=is_mc, choices=choices, response_schema=response_schema
+    ) else 0.0
+    if not accuracy_valid or conf < 0:
+        fmt_ok = 0.0
+    trailing_text = _trailing_text_after_box(solution_str) if response_schema == "boxed" else _trailing_text_after_confidence(solution_str)
     trailing_text_len = len(trailing_text)
 
     # --- think block analysis for case study ---
@@ -336,15 +425,12 @@ def compute_score(
     if confidence_raw is None:
         confidence_raw = -1.0
 
-    acc = 0.0
-    if pred is not None and ground_truth is not None:
+    acc = -1.0 if not accuracy_valid else 0.0
+    if accuracy_valid and ground_truth is not None:
         gt = str(ground_truth)
         acc = 1.0 if (match_option(pred, gt, choices) if is_mc else match_freeform(pred, gt)) else 0.0
 
-    # Do not grant positive task reward unless the response satisfies the
-    # strict answer/confidence schema. Keeping raw acc separately is useful for
-    # diagnostics, but reward shaping should follow the formatted contract.
-    reward_acc = acc if fmt_ok > 0.5 else 0.0
+    reward_acc = max(acc, 0.0)
 
     # Format penalty: subtract fmt_coef when format requirements not met
     tail_penalty = 0.0
@@ -355,6 +441,7 @@ def compute_score(
         solution_str,
         is_multiple_choice=is_mc,
         choices=choices,
+        response_schema=response_schema,
     )
     schema_bonus = 0.0
     if fmt_ok <= 0.5 and schema_bonus_coef > 0.0:
@@ -365,9 +452,9 @@ def compute_score(
     score = reward_acc - fmt_coef * (1.0 - fmt_ok) - tail_penalty + schema_bonus
 
     # --- calibration gap for this sample ---
-    calib_gap = abs(conf - acc) if conf >= 0 else -1.0
+    calib_gap = abs(conf - acc) if conf >= 0 and accuracy_valid else -1.0
     # overconfident: wrong but high conf; underconfident: correct but low conf
-    is_overconfident = 1.0 if (acc < 0.5 and conf > 0.5) else 0.0
+    is_overconfident = 1.0 if (accuracy_valid and acc < 0.5 and conf > 0.5) else 0.0
     is_underconfident = 1.0 if (acc > 0.5 and conf < 0.5) else 0.0
 
     # keep raw score for diagnostics, but provide a normalized [0,1] score
@@ -397,8 +484,11 @@ def compute_score(
         "score_raw": raw_score,
         "score_norm": score_norm,
         "acc": acc,
+        "accuracy_valid": float(accuracy_valid),
+        "skip_reason": skip_reason,
         "reward_acc": reward_acc,
         "confidence": conf,
+        "confidence_valid": float(conf >= 0),
         "format_ok": fmt_ok,
         "answer_format_ok": answer_format_ok,
         "format_penalty_coef": fmt_coef,
@@ -418,4 +508,7 @@ def compute_score(
         "calibration_gap": calib_gap,
         "is_overconfident": is_overconfident,
         "is_underconfident": is_underconfident,
+        "pair_id": extra_info.get("pair_id", -1),
+        "is_noisy": extra_info.get("is_noisy", 0.0),
+        "corruption_level": extra_info.get("corruption_level", 0.0),
     }

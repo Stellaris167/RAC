@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.rac import RAC_BATCH_KEYS, compute_rac_policy_loss
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -526,6 +527,9 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        rac_loss_weights = data.meta_info.get("rac_loss_weights")
+        if rac_loss_weights is not None:
+            select_keys.extend(RAC_BATCH_KEYS)
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         if self.config.use_kl_loss:
@@ -559,6 +563,14 @@ class DataParallelPPOActor(BasePPOActor):
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                if rac_loss_weights is not None:
+                    branch_counts = torch.stack(
+                        [mini_batch.batch["reasoning_mask"].sum(), mini_batch.batch["confidence_mask"].sum()]
+                    ).to(get_device_id())
+                    torch.distributed.all_reduce(branch_counts)
+                    rac_batch_num_tokens = dict(
+                        zip(("task", "confidence"), branch_counts.tolist(), strict=True)
+                    )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -618,15 +630,28 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if rac_loss_weights is not None:
+                        pg_loss, pg_metrics = compute_rac_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            **{key: model_inputs[key] for key in RAC_BATCH_KEYS},
+                            loss_weights=rac_loss_weights,
+                            config=self.config,
+                            batch_num_tokens=rac_batch_num_tokens,
+                            dp_size=torch.distributed.get_world_size(),
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    else:
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
@@ -643,7 +668,7 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
 
-                    policy_loss = pg_loss
+                    policy_loss = pg_loss / loss_scale_factor if rac_loss_weights is not None else pg_loss
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()

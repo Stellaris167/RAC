@@ -40,6 +40,8 @@ _TRAIN_REWARD_EXTRA_METRIC_MAP = {
     "kendall_tau_pvalue": "calibration/kendall_tau_pvalue",
     "mean_confidence": "calibration/mean_confidence",
     "mean_accuracy": "calibration/mean_accuracy",
+    "accuracy_valid_count": "accuracy/valid_count",
+    "accuracy_skipped_count": "accuracy/skipped_count",
     "confidence_std": "calibration/confidence_std",
     "accuracy_std": "calibration/accuracy_std",
     "high_conf_error_ratio": "calibration/high_conf_error_ratio",
@@ -228,22 +230,39 @@ def _build_validation_aggregate_samples(
     return aggregate_data_sources, aggregate_sample_uids, aggregate_infos_dict
 
 
+def _paired_calibration_values(confidences, accuracies):
+    conf = np.asarray(confidences, dtype=np.float64).reshape(-1)
+    acc = np.asarray(accuracies, dtype=np.float64).reshape(-1)
+    valid_mask = np.isfinite(conf) & np.isfinite(acc) & (conf >= 0) & (conf <= 1) & (acc >= 0) & (acc <= 1)
+    return conf[valid_mask], acc[valid_mask]
+
+
+def _binary_auroc(labels, scores):
+    labels = np.asarray(labels, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    positive = labels == 1
+    negative = labels == 0
+    if not positive.any() or not negative.any():
+        return None
+
+    order = np.argsort(scores, kind="stable")
+    ranks = np.empty(len(scores), dtype=np.float64)
+    start = 0
+    while start < len(scores):
+        end = start + 1
+        while end < len(scores) and scores[order[end]] == scores[order[start]]:
+            end += 1
+        ranks[order[start:end]] = (start + 1 + end) / 2
+        start = end
+    n_positive = int(positive.sum())
+    n_negative = int(negative.sum())
+    return float((ranks[positive].sum() - n_positive * (n_positive + 1) / 2) / (n_positive * n_negative))
+
+
 def _compute_validation_calibration_values(confidences: list[float], accuracies: list[float]) -> dict[str, float]:
-    conf = _coerce_numeric_array(confidences)
-    acc = _coerce_numeric_array(accuracies)
-    if conf is None or acc is None:
+    valid_confs, valid_accs = _paired_calibration_values(confidences, accuracies)
+    if valid_confs.size == 0:
         return {}
-
-    size = min(conf.size, acc.size)
-    conf = conf[:size]
-    acc = acc[:size]
-
-    valid_mask = np.isfinite(conf) & np.isfinite(acc) & (conf >= 0)
-    if valid_mask.sum() == 0:
-        return {}
-
-    valid_confs = conf[valid_mask]
-    valid_accs = acc[valid_mask]
     metrics = {
         "ece": _binary_ece(valid_confs, valid_accs),
         "brier_score": float(((valid_confs - valid_accs) ** 2).mean()),
@@ -268,15 +287,28 @@ def _compute_validation_group_calibration_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         confidences = []
         accuracies = []
+        rollout_confidences = []
+        rollout_accuracies = []
         for var2vals in uid2var2vals.values():
-            conf = _coerce_numeric_array(var2vals.get("confidence", []))
-            acc = _coerce_numeric_array(var2vals.get("acc", []))
-            if conf is None or acc is None:
+            if "confidence" not in var2vals or "acc" not in var2vals:
+                continue
+            conf, acc = _paired_calibration_values(var2vals["confidence"], var2vals["acc"])
+            if conf.size == 0:
                 continue
             confidences.append(float(conf.mean()))
             accuracies.append(float(acc.mean()))
+            rollout_confidences.extend(conf.tolist())
+            rollout_accuracies.extend(acc.tolist())
 
         calibration_metrics = _compute_validation_calibration_values(confidences, accuracies)
+        conf = np.asarray(rollout_confidences)
+        acc = np.asarray(rollout_accuracies)
+        valid = np.isfinite(conf) & np.isfinite(acc) & (conf >= 0) & (conf <= 1) & np.isin(acc, [0, 1])
+        calibration_metrics["auroc_valid_count"] = int(valid.sum())
+        # AUROC ranks individual answers, not prompt-averaged success rates.
+        auroc = _binary_auroc(acc[valid], conf[valid])
+        if auroc is not None:
+            calibration_metrics["auroc"] = auroc
         if calibration_metrics:
             data_src2var2metric2val[data_source]["calibration"].update(calibration_metrics)
 
@@ -787,6 +819,8 @@ def process_validation_metrics(
     data_src2uid2var2vals = _group_validation_values_by_source_uid(data_sources, sample_uids, infos_dict)
 
     data_src2var2metric2val = _process_validation_metrics_from_grouped_values(data_src2uid2var2vals, seed=seed)
+    for source, metrics in _compute_validation_group_calibration_metrics(data_src2uid2var2vals).items():
+        data_src2var2metric2val[source].update(metrics)
 
     aggregate_data_sources, aggregate_sample_uids, aggregate_infos_dict = _build_validation_aggregate_samples(
         data_sources, sample_uids, infos_dict
@@ -831,6 +865,7 @@ def _process_validation_metrics_from_grouped_values(
 
     # 3. cache metric results
     data_src2uid2var2metric = {}
+    accuracy_weights = {}
 
     # 4. flatten loop
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
@@ -847,9 +882,20 @@ def _process_validation_metrics_from_grouped_values(
                 if not var_vals or isinstance(var_vals[0], str):
                     continue
 
-                # compute mean and std
+                original_n = len(var_vals)
+                local_preds = pred_vals
+                if var_name == "acc":
+                    indices = [i for i, value in enumerate(var_vals) if np.isfinite(value) and 0 <= value <= 1]
+                    var_vals = [var_vals[i] for i in indices]
+                    if not var_vals:
+                        continue
+                    if has_pred:
+                        local_preds = [pred_vals[i] for i in indices]
+                    accuracy_weights[(data_source, uid, f"mean@{original_n}")] = len(var_vals)
+
+                # Retain the requested rollout count in mean metric names.
                 n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                metric = {f"mean@{original_n}": float(np_mean(var_vals))}
 
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = float(np_std(var_vals))
@@ -878,7 +924,7 @@ def _process_validation_metrics_from_grouped_values(
                         if has_pred:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred} for val, pred in zip(var_vals, local_preds, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
@@ -895,15 +941,25 @@ def _process_validation_metrics_from_grouped_values(
 
     # Aggregate metrics across uids
     data_src2var2metric2uid_vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    accuracy_mean_weights = defaultdict(list)
     for data_source, uid2var2metric in data_src2uid2var2metric.items():
         for uid, var2metric in uid2var2metric.items():
             for var_name, metric in var2metric.items():
                 for metric_name, metric_val in metric.items():
                     data_src2var2metric2uid_vals[data_source][var_name][metric_name].append(metric_val)
+                    if var_name == "acc" and metric_name.startswith("mean@"):
+                        accuracy_mean_weights[(data_source, metric_name)].append(accuracy_weights[(data_source, uid, metric_name)])
 
     data_src2var2metric2val = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     for data_source, var2metric2uid_vals in data_src2var2metric2uid_vals.items():
         for var_name, metric2uid_vals in var2metric2uid_vals.items():
             for metric_name, uid_vals in metric2uid_vals.items():
-                data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
+                weights = accuracy_mean_weights.get((data_source, metric_name)) if var_name == "acc" else None
+                data_src2var2metric2val[data_source][var_name][metric_name] = np.average(uid_vals, weights=weights)
+    for data_source, uid2var2vals in data_src2uid2var2vals.items():
+        values = [value for var2vals in uid2var2vals.values() for value in var2vals.get("acc", [])]
+        if values:
+            valid_count = sum(np.isfinite(value) and 0 <= value <= 1 for value in values)
+            data_src2var2metric2val[data_source]["acc"]["valid_count"] = int(valid_count)
+            data_src2var2metric2val[data_source]["acc"]["skipped_count"] = len(values) - int(valid_count)
     return data_src2var2metric2val

@@ -118,45 +118,6 @@ Supported modes:
 - train_main: build train_pair_main with the 50/40/10 noisy mixture used in the paper.
 - test_corrupt: build corrupted benchmark test sets.
 
-## Training
-
-The main paper runs are launched from examples/confidence_rl.
-
-Qwen2.5-VL-3B/7B-Instruct:
-
-```bash
-DATA_ROOT=/path/to/your_data \
-EXP=pair_main \
-bash examples/confidence_rl/run_qwen2_5_vl_3b/7b_instruct.sh
-```
-
-InternVL3.5-8B:
-
-```bash
-DATA_ROOT=/path/to/your_data \
-EXP=pair_main \
-bash examples/confidence_rl/run_internvl3_5_8b.sh
-```
-
-Supported experiment switches:
-
-- baseline
-- ranking
-- pair_T0.2
-- pair_T0.4
-- pair_T0.6
-- pair_T0.8
-- pair_T1.0
-- pair_main
-
-Both launcher scripts support a dry-run mode that expands the resolved model, dataset, cache, and validation paths without starting training:
-
-```bash
-DRY_RUN=1 \
-DATA_ROOT=/path/to/your_data \
-bash examples/confidence_rl/run_qwen2_5_vl_7b_instruct.sh
-```
-
 ## Paper Summary
 
 The paper studies calibration as a first-class training objective in multimodal RL rather than a post-hoc correction step. RAC uses rollout comparisons that are already available during training and adds no external confidence annotations. Empirically, the ranking-aware loss improves accuracy by making the policy discriminate better between strong and weak reasoning paths, while the clean-corrupted pairwise loss improves calibration under degraded visual evidence. Their combination gives the best overall trade-off across the tested backbones and benchmarks.

@@ -206,6 +206,13 @@ def apply_reward_shaping(
     metric_accs = np.asarray(reward_extra_infos_dict.get("acc", [0.0] * n), dtype=np.float64)
     shaping_accs = np.asarray(reward_extra_infos_dict.get("reward_acc", metric_accs), dtype=np.float64)
     confs = np.asarray(reward_extra_infos_dict.get("confidence", [-1.0] * n), dtype=np.float64)
+    accuracy_valid = np.isfinite(metric_accs) & (metric_accs >= 0.0) & (metric_accs <= 1.0)
+    if "accuracy_valid" in reward_extra_infos_dict:
+        accuracy_valid &= np.asarray(reward_extra_infos_dict["accuracy_valid"], dtype=np.float64) > 0.5
+    confidence_valid = np.isfinite(confs) & (confs >= 0.0) & (confs <= 1.0)
+    if "confidence_valid" in reward_extra_infos_dict:
+        confidence_valid &= np.asarray(reward_extra_infos_dict["confidence_valid"], dtype=np.float64) > 0.5
+    confs = np.where(accuracy_valid & confidence_valid, confs, -1.0)
 
     uid_arr = None
     if "uid" in batch.non_tensor_batch:
@@ -224,6 +231,12 @@ def apply_reward_shaping(
                 return np.asarray(batch.non_tensor_batch[key], dtype=np.float64)
             if key in reward_extra_infos_dict:
                 return np.asarray(reward_extra_infos_dict[key], dtype=np.float64)
+            if "extra_info" in batch.non_tensor_batch:
+                values = [
+                    extra.get(key, default) if isinstance(extra, dict) else default
+                    for extra in batch.non_tensor_batch["extra_info"]
+                ]
+                return np.asarray(values, dtype=np.float64)
             return np.full(n, default, dtype=np.float64)
 
         pair_ids = _get_array("pair_id", -1).astype(np.int64)
@@ -239,7 +252,12 @@ def apply_reward_shaping(
         valid_response = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).cpu().numpy()
         len_bonus = valid_response / 1000.0
 
-    total_bonus = rank_coef * rank_bonus + corr_coef * pair_bonus + len_coef * len_bonus
+    route_calibration_tokens = rank_coef != 0.0 or corr_coef != 0.0
+    if route_calibration_tokens:
+        batch.batch["rank_rewards"] = reward_tensor.new_tensor(rank_bonus)
+        batch.batch["pair_rewards"] = reward_tensor.new_tensor(pair_bonus)
+        batch.meta_info["rac_loss_weights"] = {"rank": rank_coef, "pair": corr_coef}
+    total_bonus = len_coef * len_bonus
     if abs(total_bonus.sum()) > 1e-12:
         prompt_len = batch.batch["prompts"].shape[1]
         valid_response_lengths = batch.batch["attention_mask"][:, prompt_len:].sum(dim=1).long()
@@ -252,6 +270,12 @@ def apply_reward_shaping(
     reward_extra_infos_dict["pair_bonus"] = pair_bonus.tolist()
     reward_extra_infos_dict["pair_count"] = [float(pair_count)] * n
     reward_extra_infos_dict["clean_minus_noisy_conf"] = [clean_minus_noisy_conf] * n
+    reward_extra_infos_dict["accuracy_valid_count"] = [int(accuracy_valid.sum())] * n
+    reward_extra_infos_dict["accuracy_skipped_count"] = [int((~accuracy_valid).sum())] * n
+
+    if accuracy_valid.any():
+        reward_extra_infos_dict["mean_accuracy"] = [float(metric_accs[accuracy_valid].mean())] * n
+        reward_extra_infos_dict["accuracy_std"] = [float(metric_accs[accuracy_valid].std())] * n
 
     valid_mask = confs >= 0
     if valid_mask.sum() > 0:
@@ -269,8 +293,6 @@ def apply_reward_shaping(
             reward_extra_infos_dict[f"{tag}/avg_acc"] = [entry["avg_acc"]] * n
             reward_extra_infos_dict[f"{tag}/gap"] = [entry["gap"]] * n
 
-        reward_extra_infos_dict["mean_accuracy"] = [float(valid_accs.mean())] * n
-        reward_extra_infos_dict["accuracy_std"] = [float(valid_accs.std())] * n
         reward_extra_infos_dict["confidence_std"] = [float(valid_confs.std())] * n
 
         if len(valid_confs) >= 5 and scipy_stats is not None:
